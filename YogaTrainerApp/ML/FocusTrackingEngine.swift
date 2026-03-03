@@ -7,9 +7,7 @@ class FocusTrackingEngine {
     private var trackingRequest: VNTrackObjectRequest?
 
     init() {
-        if let model = try? yolov8n(configuration: MLModelConfiguration()).model {
-            detectionModel = try? VNCoreMLModel(for: model)
-        }
+        detectionModel = Self.loadModel(named: "yolov8n")
     }
 
     func process(buffer: CVPixelBuffer,
@@ -31,7 +29,10 @@ class FocusTrackingEngine {
     private func detect(buffer: CVPixelBuffer,
                         completion: @escaping (VNDetectedObjectObservation?) -> Void) {
 
-        guard let model = detectionModel else { return }
+        guard let model = detectionModel else {
+            completion(nil)
+            return
+        }
 
         let request = VNCoreMLRequest(model: model) { request, _ in
             let results = request.results as? [VNRecognizedObjectObservation] ?? []
@@ -57,5 +58,14 @@ class FocusTrackingEngine {
 
         let handler = VNImageRequestHandler(cvPixelBuffer: buffer)
         try? handler.perform([request])
+    }
+
+    private static func loadModel(named name: String) -> VNCoreMLModel? {
+        guard let url = Bundle.main.url(forResource: name, withExtension: "mlmodelc"),
+              let model = try? MLModel(contentsOf: url) else {
+            return nil
+        }
+
+        return try? VNCoreMLModel(for: model)
     }
 }
