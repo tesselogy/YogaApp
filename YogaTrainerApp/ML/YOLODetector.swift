@@ -82,36 +82,96 @@ final class YOLODetector {
         }
 
         do {
-            let provider = try MLDictionaryFeatureProvider(dictionary: [inputName: MLFeatureValue(pixelBuffer: prepared.buffer)])
-            let prediction = try model.prediction(from: provider)
-
-            let all = decodeYOLOOutput(
-                prediction: prediction,
-                frameWidth: prepared.frameWidth,
-                frameHeight: prepared.frameHeight,
-                modelInputWidth: prepared.modelWidth,
-                modelInputHeight: prepared.modelHeight
-            )
-            let persons = all.filter { $0.classIndex == personClassIndex }
-            let nms = nonMaximumSuppression(persons, iouThreshold: iouThreshold)
+            let result = try runPrediction(buffer: prepared.buffer,
+                                           frameWidth: prepared.frameWidth,
+                                           frameHeight: prepared.frameHeight,
+                                           modelWidth: prepared.modelWidth,
+                                           modelHeight: prepared.modelHeight)
 
             let shapeInfo = outputNames
                 .compactMap { name -> String? in
-                    guard let m = prediction.featureValue(for: name)?.multiArrayValue else { return nil }
+                    guard let m = result.prediction.featureValue(for: name)?.multiArrayValue else { return nil }
                     return "\(name):\(m.shape.map{$0.intValue})"
                 }
                 .joined(separator: ",")
 
             let actualFormat = CVPixelBufferGetPixelFormatType(frame)
             let preparedFormat = CVPixelBufferGetPixelFormatType(prepared.buffer)
-            lastDebugMessage = "fmt=\(pixelFormatName(actualFormat))->\(pixelFormatName(preparedFormat)) size=\(prepared.frameWidth)x\(prepared.frameHeight)->\(prepared.modelWidth)x\(prepared.modelHeight) outputs=[\(shapeInfo)] all=\(all.count) person=\(persons.count) nms=\(nms.count)"
-            return nms
+            lastDebugMessage = "fmt=\(pixelFormatName(actualFormat))->\(pixelFormatName(preparedFormat)) size=\(prepared.frameWidth)x\(prepared.frameHeight)->\(prepared.modelWidth)x\(prepared.modelHeight) outputs=[\(shapeInfo)] all=\(result.all.count) person=\(result.persons.count) nms=\(result.nms.count)"
+            return result.nms
         } catch {
+            if error.localizedDescription.contains("not in allowed set of image sizes"),
+               let fallback = fallbackPredictionWithCandidateSizes(frame: frame, originalError: error) {
+                return fallback
+            }
+
             let expected = pixelFormatName(inputConstraint?.pixelFormatType ?? 0)
             let expectedSize = expectedModelSizeDescription()
             lastDebugMessage = "prediction_failed expected_fmt=\(expected) expected_size=\(expectedSize) err=\(error.localizedDescription)"
             return []
         }
+    }
+
+
+    private func runPrediction(buffer: CVPixelBuffer,
+                               frameWidth: Int,
+                               frameHeight: Int,
+                               modelWidth: Int,
+                               modelHeight: Int) throws -> (prediction: MLFeatureProvider, all: [Detection], persons: [Detection], nms: [Detection]) {
+        let provider = try MLDictionaryFeatureProvider(dictionary: [inputName: MLFeatureValue(pixelBuffer: buffer)])
+        let prediction = try model.prediction(from: provider)
+
+        let all = decodeYOLOOutput(
+            prediction: prediction,
+            frameWidth: frameWidth,
+            frameHeight: frameHeight,
+            modelInputWidth: modelWidth,
+            modelInputHeight: modelHeight
+        )
+        let persons = all.filter { $0.classIndex == personClassIndex }
+        let nms = nonMaximumSuppression(persons, iouThreshold: iouThreshold)
+
+        return (prediction, all, persons, nms)
+    }
+
+    private func fallbackPredictionWithCandidateSizes(frame: CVPixelBuffer,
+                                                      originalError: Error) -> [Detection]? {
+        let frameWidth = CVPixelBufferGetWidth(frame)
+        let frameHeight = CVPixelBufferGetHeight(frame)
+        let actualFormat = CVPixelBufferGetPixelFormatType(frame)
+
+        let candidates = [192, 224, 256, 320, 384, 416, 448, 512, 576, 608, 640, 672, 704, 736, 768, 800, 960, 1024, 1280]
+
+        for side in candidates {
+            guard let candidateBuffer = resizeBuffer(frame: frame,
+                                                     targetWidth: side,
+                                                     targetHeight: side,
+                                                     targetFormat: inputConstraint?.pixelFormatType ?? actualFormat) else {
+                continue
+            }
+
+            do {
+                let result = try runPrediction(buffer: candidateBuffer,
+                                               frameWidth: frameWidth,
+                                               frameHeight: frameHeight,
+                                               modelWidth: side,
+                                               modelHeight: side)
+
+                let shapeInfo = outputNames
+                    .compactMap { name -> String? in
+                        guard let m = result.prediction.featureValue(for: name)?.multiArrayValue else { return nil }
+                        return "\(name):\(m.shape.map{$0.intValue})"
+                    }
+                    .joined(separator: ",")
+
+                lastDebugMessage = "fallback_size=\(side)x\(side) fmt=\(pixelFormatName(actualFormat))->\(pixelFormatName(CVPixelBufferGetPixelFormatType(candidateBuffer))) outputs=[\(shapeInfo)] all=\(result.all.count) person=\(result.persons.count) nms=\(result.nms.count) after_err=\(originalError.localizedDescription)"
+                return result.nms
+            } catch {
+                continue
+            }
+        }
+
+        return nil
     }
 
     func debugMessage() -> String {
@@ -269,6 +329,40 @@ final class YOLODetector {
                                 modelHeight: expectedHeight,
                                 frameWidth: frameWidth,
                                 frameHeight: frameHeight)
+    }
+
+
+    private func resizeBuffer(frame: CVPixelBuffer,
+                              targetWidth: Int,
+                              targetHeight: Int,
+                              targetFormat: OSType) -> CVPixelBuffer? {
+        let actualFormat = CVPixelBufferGetPixelFormatType(frame)
+        let outFormat = targetFormat == 0 ? actualFormat : targetFormat
+
+        var converted: CVPixelBuffer?
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true
+        ]
+
+        guard CVPixelBufferCreate(kCFAllocatorDefault,
+                                  targetWidth,
+                                  targetHeight,
+                                  outFormat,
+                                  attrs as CFDictionary,
+                                  &converted) == kCVReturnSuccess,
+              let converted else {
+            return nil
+        }
+
+        let srcW = CVPixelBufferGetWidth(frame)
+        let srcH = CVPixelBufferGetHeight(frame)
+        let ciImage = CIImage(cvPixelBuffer: frame)
+        let scaleX = CGFloat(targetWidth) / CGFloat(srcW)
+        let scaleY = CGFloat(targetHeight) / CGFloat(srcH)
+        let resized = ciImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+        ciContext.render(resized, to: converted)
+        return converted
     }
 
     private func expectedModelSizeDescription() -> String {
