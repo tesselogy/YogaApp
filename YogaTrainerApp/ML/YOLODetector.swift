@@ -24,6 +24,7 @@ final class YOLODetector {
     static var lastInitError: String = ""
 
     private var lastDebugMessage: String = ""
+    private var lastCoordsDump: String = ""
     private let model: MLModel
     private let inputName: String
     private let outputNames: [String]
@@ -90,7 +91,7 @@ final class YOLODetector {
             }.joined(separator: ",")
 
             let maxPersonConf = result.persons.map(\.confidence).max() ?? 0
-            lastDebugMessage = "fmt=\(pixelFormatName(CVPixelBufferGetPixelFormatType(frame)))->\(pixelFormatName(CVPixelBufferGetPixelFormatType(prepared.buffer))) size=\(prepared.frameWidth)x\(prepared.frameHeight)->\(prepared.modelWidth)x\(prepared.modelHeight) norm(scale=\(String(format: "%.4f", prepared.scale)) padX=\(String(format: "%.1f", prepared.padX)) padY=\(String(format: "%.1f", prepared.padY))) outputs=[\(shapeInfo)] all=\(result.all.count) person=\(result.persons.count) nms=\(result.nms.count) maxPersonConf=\(String(format: "%.3f", maxPersonConf))"
+            lastDebugMessage = "fmt=\(pixelFormatName(CVPixelBufferGetPixelFormatType(frame)))->\(pixelFormatName(CVPixelBufferGetPixelFormatType(prepared.buffer))) size=\(prepared.frameWidth)x\(prepared.frameHeight)->\(prepared.modelWidth)x\(prepared.modelHeight) norm(scale=\(String(format: "%.4f", prepared.scale)) padX=\(String(format: "%.1f", prepared.padX)) padY=\(String(format: "%.1f", prepared.padY))) outputs=[\(shapeInfo)] all=\(result.all.count) person=\(result.persons.count) nms=\(result.nms.count) maxPersonConf=\(String(format: "%.3f", maxPersonConf)) \(lastCoordsDump)"
             return result.nms
         } catch {
             if error.localizedDescription.contains("not in allowed set of image sizes"),
@@ -126,7 +127,7 @@ final class YOLODetector {
             do {
                 let result = try runPrediction(prepared: prepared)
                 let maxPersonConf = result.persons.map(\.confidence).max() ?? 0
-                lastDebugMessage = "fallback_size=\(side)x\(side) all=\(result.all.count) person=\(result.persons.count) nms=\(result.nms.count) maxPersonConf=\(String(format: "%.3f", maxPersonConf)) after_err=\(originalError.localizedDescription)"
+                lastDebugMessage = "fallback_size=\(side)x\(side) all=\(result.all.count) person=\(result.persons.count) nms=\(result.nms.count) maxPersonConf=\(String(format: "%.3f", maxPersonConf)) after_err=\(originalError.localizedDescription) \(lastCoordsDump)"
                 return result.nms
             } catch {
                 continue
@@ -148,6 +149,7 @@ final class YOLODetector {
         }
 
         let multiArrays: [MLMultiArray] = outputNames.compactMap { prediction.featureValue(for: $0)?.multiArrayValue }
+        lastCoordsDump = "coords_dump=na"
         guard let tensor = multiArrays.max(by: { $0.count < $1.count }) else { return [] }
         let shape = tensor.shape.map { $0.intValue }
         let values = (0..<tensor.count).map { tensor[$0].floatValue }
@@ -234,35 +236,58 @@ final class YOLODetector {
         let confVals = (0..<confs.count).map { confs[$0].floatValue }
 
         var detections: [Detection] = []
+        var dumps: [String] = []
+
         for r in 0..<rows {
             let cbase = r * 4
-            let x1raw = coordVals[cbase]
-            let y1raw = coordVals[cbase + 1]
-            let x2raw = coordVals[cbase + 2]
-            let y2raw = coordVals[cbase + 3]
+            let a = coordVals[cbase]
+            let b = coordVals[cbase + 1]
+            let c = coordVals[cbase + 2]
+            let d = coordVals[cbase + 3]
 
             var bestClass = 0
             var bestScore: Float = -Float.greatestFiniteMagnitude
             let pbase = r * classes
-            for c in 0..<classes {
-                let score = confVals[pbase + c]
+            for cls in 0..<classes {
+                let score = confVals[pbase + cls]
                 if score > bestScore {
                     bestScore = score
-                    bestClass = c
+                    bestClass = cls
                 }
             }
+
+            let normalized = max(abs(a), abs(b), abs(c), abs(d)) <= 2.0
+
+            // Interpret as XYXY
+            let x1xyxy = normalized ? a * Float(prep.modelWidth) : a
+            let y1xyxy = normalized ? b * Float(prep.modelHeight) : b
+            let x2xyxy = normalized ? c * Float(prep.modelWidth) : c
+            let y2xyxy = normalized ? d * Float(prep.modelHeight) : d
+            let mappedXYXY = mapModelBoxToFrame(x1xyxy, y1xyxy, x2xyxy, y2xyxy, prep: prep)
+
+            // Interpret as XYWH
+            let cx = normalized ? a * Float(prep.modelWidth) : a
+            let cy = normalized ? b * Float(prep.modelHeight) : b
+            let w = normalized ? c * Float(prep.modelWidth) : c
+            let h = normalized ? d * Float(prep.modelHeight) : d
+            let x1xywh = cx - w / 2
+            let y1xywh = cy - h / 2
+            let x2xywh = cx + w / 2
+            let y2xywh = cy + h / 2
+            let mappedXYWH = mapModelBoxToFrame(x1xywh, y1xywh, x2xywh, y2xywh, prep: prep)
+
+            let dump = "r\(r):raw=[\(String(format: "%.2f", a)),\(String(format: "%.2f", b)),\(String(format: "%.2f", c)),\(String(format: "%.2f", d))] norm=\(normalized ? 1 : 0) top=\(bestClass):\(String(format: "%.3f", bestScore)) xyxy=\(mappedXYXY?.debugDescription ?? "nil") xywh=\(mappedXYWH?.debugDescription ?? "nil")"
+            dumps.append(dump)
+
             guard bestScore >= confidenceThreshold else { continue }
-
-            let normalized = max(abs(x1raw), abs(y1raw), abs(x2raw), abs(y2raw)) <= 2.0
-            let x1m = normalized ? x1raw * Float(prep.modelWidth) : x1raw
-            let y1m = normalized ? y1raw * Float(prep.modelHeight) : y1raw
-            let x2m = normalized ? x2raw * Float(prep.modelWidth) : x2raw
-            let y2m = normalized ? y2raw * Float(prep.modelHeight) : y2raw
-
-            if let box = mapModelBoxToFrame(x1m, y1m, x2m, y2m, prep: prep) {
+            if let box = mappedXYXY {
                 detections.append(Detection(bbox: box, confidence: bestScore, classIndex: bestClass))
             }
         }
+
+        let space = "space(camera=\(prep.frameWidth)x\(prep.frameHeight),model=\(prep.modelWidth)x\(prep.modelHeight),scale=\(String(format: "%.4f", prep.scale)),pad=[\(String(format: "%.1f", prep.padX)),\(String(format: "%.1f", prep.padY))])"
+        lastCoordsDump = "coords_formula_probe \(space) rows=\(rows) \(dumps.joined(separator: " | "))"
+
         return detections
     }
 
