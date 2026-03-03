@@ -13,30 +13,63 @@ class FocusTrackingEngine {
         if detectionModel == nil {
             debugLog("YOLO model missing: yolov8n.mlmodelc was not found in app bundle")
         } else {
-            debugLog("YOLO model loaded successfully")
+            debugLog("YOLO model loaded successfully (used only as fallback)")
         }
     }
 
     func process(buffer: CVPixelBuffer,
                  completion: @escaping (VNDetectedObjectObservation?) -> Void) {
-        // Always redetect on every frame to avoid tracker box shrinking/drifting to chest.
-        detect(buffer: buffer, completion: completion)
+        // Primary detector: Vision human rectangles gives more stable full-body box.
+        detectHuman(buffer: buffer) { humanObservation in
+            if let humanObservation {
+                completion(humanObservation)
+                return
+            }
+
+            self.debugLog("Human rectangles found no person, trying YOLO fallback")
+            self.detectWithYOLOFallback(buffer: buffer, completion: completion)
+        }
     }
 
-    private func detect(buffer: CVPixelBuffer,
-                        completion: @escaping (VNDetectedObjectObservation?) -> Void) {
+    private func detectHuman(buffer: CVPixelBuffer,
+                             completion: @escaping (VNDetectedObjectObservation?) -> Void) {
+        let request = VNDetectHumanRectanglesRequest { request, _ in
+            let humans = request.results as? [VNHumanObservation] ?? []
 
+            guard let best = humans.max(by: {
+                ($0.boundingBox.width * $0.boundingBox.height) <
+                ($1.boundingBox.width * $1.boundingBox.height)
+            }) else {
+                completion(nil)
+                return
+            }
+
+            let expanded = self.expandForFullBody(best.boundingBox)
+            completion(VNDetectedObjectObservation(boundingBox: expanded))
+        }
+
+        let handler = VNImageRequestHandler(cvPixelBuffer: buffer)
+        do {
+            try handler.perform([request])
+        } catch {
+            debugLog("Human rectangles failed: \(error.localizedDescription)")
+            completion(nil)
+        }
+    }
+
+    private func detectWithYOLOFallback(buffer: CVPixelBuffer,
+                                        completion: @escaping (VNDetectedObjectObservation?) -> Void) {
         guard let model = detectionModel else {
-            detectHumanFallback(buffer: buffer, completion: completion)
+            completion(nil)
             return
         }
 
         let request = VNCoreMLRequest(model: model) { request, _ in
             let results = request.results as? [VNRecognizedObjectObservation] ?? []
 
-            if results.isEmpty {
-                self.debugLog("Detection returned 0 objects, trying Vision human fallback")
-                self.detectHumanFallback(buffer: buffer, completion: completion)
+            guard !results.isEmpty else {
+                self.debugLog("YOLO fallback found no objects")
+                completion(nil)
                 return
             }
 
@@ -50,12 +83,12 @@ class FocusTrackingEngine {
                 ($0.boundingBox.width * $0.boundingBox.height) <
                 ($1.boundingBox.width * $1.boundingBox.height)
             }) else {
-                self.detectHumanFallback(buffer: buffer, completion: completion)
+                completion(nil)
                 return
             }
 
             if persons.isEmpty {
-                self.debugLog("No explicit 'person' label, using largest detected object")
+                self.debugLog("YOLO fallback: no explicit 'person' label, using largest object")
             }
 
             let expanded = self.expandForFullBody(best.boundingBox)
@@ -68,35 +101,7 @@ class FocusTrackingEngine {
         do {
             try handler.perform([request])
         } catch {
-            debugLog("Detection request failed: \(error.localizedDescription), trying Vision human fallback")
-            detectHumanFallback(buffer: buffer, completion: completion)
-        }
-    }
-
-    private func detectHumanFallback(buffer: CVPixelBuffer,
-                                     completion: @escaping (VNDetectedObjectObservation?) -> Void) {
-        let request = VNDetectHumanRectanglesRequest { request, _ in
-            let humans = request.results as? [VNHumanObservation] ?? []
-
-            guard let best = humans.max(by: {
-                ($0.boundingBox.width * $0.boundingBox.height) <
-                ($1.boundingBox.width * $1.boundingBox.height)
-            }) else {
-                self.debugLog("Vision human fallback also found no person")
-                completion(nil)
-                return
-            }
-
-            self.debugLog("Vision human fallback detected person")
-            let expanded = self.expandForFullBody(best.boundingBox)
-            completion(VNDetectedObjectObservation(boundingBox: expanded))
-        }
-
-        let handler = VNImageRequestHandler(cvPixelBuffer: buffer)
-        do {
-            try handler.perform([request])
-        } catch {
-            debugLog("Vision human fallback failed: \(error.localizedDescription)")
+            debugLog("YOLO fallback failed: \(error.localizedDescription)")
             completion(nil)
         }
     }
