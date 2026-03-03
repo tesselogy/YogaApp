@@ -1,5 +1,4 @@
 import SwiftUI
-import Vision
 import Foundation
 
 struct ContentView: View {
@@ -7,99 +6,58 @@ struct ContentView: View {
     @StateObject var camera = CameraManager()
     @StateObject var poseState = PoseState()
 
-    let focusEngine = FocusTrackingEngine()
-    let classifier = ClassificationEngine()
+    private let frameProcessor = FrameProcessor()
 
-    @State var trackedObservation: VNDetectedObjectObservation?
-    @State var classificationROI: CGRect?
+    @State var trackedBBox: CGRect?
     @State var detectionStatus: String = "Waiting for person..."
     @State var isProcessingFrame: Bool = false
 
-
     var body: some View {
-
         GeometryReader { geo in
             ZStack {
-
                 if camera.currentBuffer != nil {
                     CameraPreview(pixelBuffer: camera.currentBuffer)
                         .scaledToFill()
                         .onChange(of: camera.currentBuffer) { _, newBuffer in
                             guard let buffer = newBuffer else { return }
                             guard !isProcessingFrame else { return }
+                            guard let frameProcessor else {
+                                detectionStatus = "Models not loaded"
+                                return
+                            }
+
                             isProcessingFrame = true
 
-                            focusEngine.process(buffer: buffer) { obs in
-                                guard let obs else {
-                                    DispatchQueue.main.async {
-                                        trackedObservation = nil
-                                        classificationROI = nil
+                            DispatchQueue.global(qos: .userInitiated).async {
+                                let output = frameProcessor.process(frame: buffer)
+                                DispatchQueue.main.async {
+                                    if let track = output.selectedTrack {
+                                        trackedBBox = track.smoothedBBox
+                                        detectionStatus = "Person detected (id: \(track.id))"
+                                        poseState.update(newPose: output.label)
+                                    } else {
+                                        trackedBBox = nil
                                         detectionStatus = "Person not detected"
                                         poseState.update(newPose: "no_person")
-                                        isProcessingFrame = false
                                     }
-                                    return
-                                }
 
-                                let roi = obs.boundingBox
-
-                                classifier.classify(buffer: buffer, regionOfInterest: roi) { label, confidence in
-                                    DispatchQueue.main.async {
-                                        trackedObservation = obs
-                                        classificationROI = roi
-                                        detectionStatus = "Person detected"
-                                        poseState.update(newPose: label)
-                                        print("[ContentView] pose=\(label) confidence=\(String(format: "%.2f", confidence)) detection=\(detectionStatus)")
-                                        isProcessingFrame = false
-                                    }
+                                    print("[ContentView] pose=\(output.label) confidence=\(String(format: \"%.2f\", output.confidence)) detection=\(detectionStatus)")
+                                    isProcessingFrame = false
                                 }
                             }
                         }
                 }
 
-                if let trackedObservation {
-                    DetectionBox(observation: trackedObservation)
+                if let trackedBBox,
+                   let buffer = camera.currentBuffer {
+                    DetectionBox(rect: trackedBBox,
+                                 frameWidth: CVPixelBufferGetWidth(buffer),
+                                 frameHeight: CVPixelBufferGetHeight(buffer))
                         .stroke(.green, lineWidth: 4)
-                        .frame(
-                            width: trackedObservation.boundingBox.width * geo.size.width,
-                            height: trackedObservation.boundingBox.height * geo.size.height
-                        )
-                        .position(
-                            x: trackedObservation.boundingBox.midX * geo.size.width,
-                            y: (1 - trackedObservation.boundingBox.midY) * geo.size.height
-                        )
-                }
-
-                if let classificationROI {
-                    DetectionBox(observation: VNDetectedObjectObservation(boundingBox: classificationROI))
-                        .stroke(.yellow, style: StrokeStyle(lineWidth: 3, dash: [10, 8]))
-                        .frame(
-                            width: classificationROI.width * geo.size.width,
-                            height: classificationROI.height * geo.size.height
-                        )
-                        .position(
-                            x: classificationROI.midX * geo.size.width,
-                            y: (1 - classificationROI.midY) * geo.size.height
-                        )
+                        .frame(width: geo.size.width, height: geo.size.height)
                 }
 
                 VStack {
-                    HStack {
-                        Spacer()
-
-                        if classificationROI != nil {
-                            Text("Yellow dashed box = ROI for classify")
-                                .font(.caption)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .background(.black.opacity(0.45))
-                                .foregroundColor(.yellow)
-                                .cornerRadius(10)
-                                .padding(.top, 30)
-                                .padding(.trailing, 20)
-                        }
-                    }
-
                     Spacer()
 
                     Text(poseState.pose.uppercased())
@@ -113,7 +71,7 @@ struct ContentView: View {
                         )
                         .shadow(radius: 15)
 
-                    Text("Hold: \(poseState.holdTime, specifier: "%.1f")s")
+                    Text("Hold: \(poseState.holdTime, specifier: \"%.1f\")s")
                         .font(.title3)
                         .foregroundColor(.white.opacity(0.8))
 
@@ -126,13 +84,6 @@ struct ContentView: View {
                         .cornerRadius(12)
 
                     Spacer()
-
-                    Text("Press Q to quit")
-                        .font(.caption)
-                        .padding(12)
-                        .background(.ultraThinMaterial)
-                        .cornerRadius(18)
-                        .padding(.bottom, 40)
                 }
             }
             .ignoresSafeArea()
@@ -141,9 +92,24 @@ struct ContentView: View {
 }
 
 private struct DetectionBox: Shape {
-    let observation: VNDetectedObjectObservation
+    let rect: CGRect
+    let frameWidth: Int
+    let frameHeight: Int
 
-    func path(in rect: CGRect) -> Path {
-        Path(CGRect(origin: .zero, size: rect.size))
+    func path(in drawRect: CGRect) -> Path {
+        guard frameWidth > 0, frameHeight > 0 else { return Path() }
+        let sx = drawRect.width / CGFloat(frameWidth)
+        let sy = drawRect.height / CGFloat(frameHeight)
+
+        let scaled = CGRect(
+            x: rect.minX * sx,
+            y: rect.minY * sy,
+            width: rect.width * sx,
+            height: rect.height * sy
+        )
+
+        var path = Path()
+        path.addRect(scaled)
+        return path
     }
 }
