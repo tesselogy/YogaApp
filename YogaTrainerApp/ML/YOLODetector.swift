@@ -10,6 +10,8 @@ struct Detection {
 }
 
 final class YOLODetector {
+    static var lastInitError: String = ""
+
     private var lastDebugMessage: String = ""
     private let model: MLModel
     private let inputName: String
@@ -25,12 +27,32 @@ final class YOLODetector {
           confidenceThreshold: Float = 0.25,
           iouThreshold: Float = 0.45,
           personClassIndex: Int = 0) {
-        guard let url = Bundle.main.url(forResource: modelName, withExtension: "mlmodelc"),
-              let loadedModel = try? MLModel(contentsOf: url) else {
+        guard let url = Bundle.main.url(forResource: modelName, withExtension: "mlmodelc") else {
+            Self.lastInitError = "model_not_found:\(modelName).mlmodelc"
             return nil
         }
 
+        func loadModel(computeUnits: MLComputeUnits) throws -> MLModel {
+            let config = MLModelConfiguration()
+            config.computeUnits = computeUnits
+            return try MLModel(contentsOf: url, configuration: config)
+        }
+
+        let loadedModel: MLModel
+        do {
+            loadedModel = try loadModel(computeUnits: .all)
+        } catch {
+            do {
+                loadedModel = try loadModel(computeUnits: .cpuOnly)
+                Self.lastInitError = "fallback_cpu_only_used after all_failed: \(error.localizedDescription)"
+            } catch {
+                Self.lastInitError = "model_load_failed: \(error.localizedDescription)"
+                return nil
+            }
+        }
+
         guard let imageInput = loadedModel.modelDescription.inputDescriptionsByName.first(where: { $0.value.type == .image })?.key else {
+            Self.lastInitError = "image_input_not_found"
             return nil
         }
 

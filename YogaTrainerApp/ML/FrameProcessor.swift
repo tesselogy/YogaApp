@@ -9,6 +9,7 @@ struct FrameOutput {
 }
 
 final class FrameProcessor {
+    static var lastInitError: String = ""
     private let detector: YOLODetector
     private let tracker: ByteTracker
     private let selector: CandidateSelector
@@ -17,11 +18,16 @@ final class FrameProcessor {
 
     private let classifyEveryNFrames: Int
     private var frameCounter: Int = 0
-    private var cachedResult: ClassificationResult = .init(label: "...", confidence: 0)
+    private var cachedResult: ClassificationResult = .init(label: "...", confidence: 0, debug: "cold_start")
 
     init?(classifyEveryNFrames: Int = 3) {
-        guard let detector = YOLODetector(),
-              let classifier = PoseClassifier() else {
+        guard let detector = YOLODetector() else {
+            Self.lastInitError = "detector_init_failed: \(YOLODetector.lastInitError)"
+            return nil
+        }
+
+        guard let classifier = PoseClassifier() else {
+            Self.lastInitError = "classifier_init_failed: \(PoseClassifier.lastInitError)"
             return nil
         }
 
@@ -50,7 +56,7 @@ final class FrameProcessor {
             if frameCounter % classifyEveryNFrames == 0 {
                 if let crop = cropper.crop(frame: frame, bboxXYXY: selected.smoothedBBox) {
                     cachedResult = classifier.classify(cropBuffer: crop)
-                    stage += " crop=ok classify=\(cachedResult.label):\(String(format: "%.2f", cachedResult.confidence))"
+                    stage += " crop=ok classify=\(cachedResult.label):\(String(format: "%.2f", cachedResult.confidence)) clsdbg=\(cachedResult.debug)"
                 } else {
                     stage += " crop=empty"
                 }

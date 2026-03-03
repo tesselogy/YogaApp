@@ -24,6 +24,7 @@ struct ContentView: View {
                             guard !isProcessingFrame else { return }
                             guard let frameProcessor else {
                                 detectionStatus = "Models not loaded"
+                                debugLine = FrameProcessor.lastInitError
                                 return
                             }
 
