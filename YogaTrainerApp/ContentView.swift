@@ -10,11 +10,9 @@ struct ContentView: View {
     let focusEngine = FocusTrackingEngine()
     let classifier = ClassificationEngine()
 
-    @State var trackedObservation: VNDetectedObjectObservation?
-    @State var classificationROI: CGRect?
-    @State var detectionStatus: String = "Waiting for person..."
-    @State var isProcessingFrame: Bool = false
-    @State private var frameCounter: Int = 0
+    @State private var trackedObservation: VNDetectedObjectObservation?
+    @State private var detectionStatus: String = "Waiting for person..."
+    @State private var isProcessingFrame: Bool = false
     @State private var imageSize: CGSize = .zero
 
     // Pipeline stabilizers
@@ -25,6 +23,7 @@ struct ContentView: View {
     @State private var voteWindow: [String] = []
     @State private var pendingPose: String?
     @State private var pendingPoseSince: Date = .distantPast
+    @State private var boxConfidence: Double = 0
 
     private let processingQueue = DispatchQueue(label: "vision.processing.queue", qos: .userInitiated)
 
@@ -36,21 +35,10 @@ struct ContentView: View {
     private let poseSwitchHysteresis: TimeInterval = 0.45
     private let roiInterpolationAlpha: CGFloat = 0.35
 
-    private func expandedROI(from bbox: CGRect) -> CGRect {
-        let widthScale: CGFloat = 2.0
-        let heightScale: CGFloat = 2.3
-        let newWidth = min(1, bbox.width * widthScale)
-        let newHeight = min(1, bbox.height * heightScale)
-        let newX = max(0, min(1 - newWidth, bbox.midX - newWidth / 2))
-        let newY = max(0, min(1 - newHeight, bbox.midY - newHeight / 2))
-        return CGRect(x: newX, y: newY, width: newWidth, height: newHeight)
-    }
-
     var body: some View {
 
         GeometryReader { geo in
             ZStack {
-
                 CameraPreview(session: camera.captureSession)
                     .scaledToFill()
                     .onChange(of: camera.currentBuffer) { _, newBuffer in
@@ -58,57 +46,40 @@ struct ContentView: View {
                         guard !isProcessingFrame else { return }
 
                         let now = Date()
-                        let minInterval = 1.0 / targetInferenceFPS
-                        guard now.timeIntervalSince(lastInferenceAt) >= minInterval else { return }
+                        guard now.timeIntervalSince(lastInferenceAt) >= 1.0 / targetInferenceFPS else { return }
                         lastInferenceAt = now
 
                         imageSize = CGSize(width: CVPixelBufferGetWidth(buffer),
                                            height: CVPixelBufferGetHeight(buffer))
-
                         isProcessingFrame = true
-                        frameCounter += 1
 
-                        let lastLockedObservation = lockedObservation
-                        let currentlyLockedObservation = (now < focusLockUntil) ? lastLockedObservation : nil
-                        let shouldRedetect = currentlyLockedObservation == nil && (lastLockedObservation == nil || frameCounter % 3 == 0)
+                        let lockObs = (now < focusLockUntil) ? lockedObservation : nil
 
                         processingQueue.async {
-                            if shouldRedetect {
-                                focusEngine.process(buffer: buffer) { obs in
-                                    guard let obs else {
-                                        DispatchQueue.main.async {
-                                            if let lockObs = lockedObservation, Date() < focusLockUntil {
-                                                classify(buffer: buffer, observation: lockObs)
-                                            } else {
-                                                trackedObservation = nil
-                                                classificationROI = nil
-                                                smoothedROI = nil
-                                                detectionStatus = "Person not detected"
-                                                pushVote("unknown")
-                                                applyPoseFromVotes()
-                                                isProcessingFrame = false
-                                            }
-                                        }
-                                        return
-                                    }
-
-                                    DispatchQueue.main.async {
-                                        lockedObservation = obs
-                                        focusLockUntil = Date().addingTimeInterval(focusLockDuration)
-                                        classify(buffer: buffer, observation: obs)
-                                    }
-                                }
-                            } else if let lockObs = currentlyLockedObservation {
+                            if let lockObs {
                                 DispatchQueue.main.async {
                                     classify(buffer: buffer, observation: lockObs)
                                 }
-                            } else if let lastObs = lastLockedObservation {
+                                return
+                            }
+
+                            focusEngine.process(buffer: buffer) { obs in
                                 DispatchQueue.main.async {
-                                    classify(buffer: buffer, observation: lastObs)
-                                }
-                            } else {
-                                DispatchQueue.main.async {
-                                    isProcessingFrame = false
+                                    guard let obs else {
+                                        trackedObservation = nil
+                                        smoothedROI = nil
+                                        detectionStatus = "Person not detected"
+                                        boxConfidence = 0
+                                        voteWindow.removeAll()
+                                        pendingPose = nil
+                                        poseState.reset(to: "no_person")
+                                        isProcessingFrame = false
+                                        return
+                                    }
+
+                                    lockedObservation = obs
+                                    focusLockUntil = Date().addingTimeInterval(focusLockDuration)
+                                    classify(buffer: buffer, observation: obs)
                                 }
                             }
                         }
@@ -116,70 +87,67 @@ struct ContentView: View {
 
                 if let trackedObservation {
                     let rect = toPreviewRect(normalizedBBox: trackedObservation.boundingBox, viewSize: geo.size)
-                    DetectionBox(observation: trackedObservation)
-                        .stroke(.green, lineWidth: 4)
-                        .frame(width: rect.width, height: rect.height)
-                        .position(x: rect.midX, y: rect.midY)
-                }
 
-                if let classificationROI {
-                    let rect = toPreviewRect(normalizedBBox: classificationROI, viewSize: geo.size)
-                    DetectionBox(observation: VNDetectedObjectObservation(boundingBox: classificationROI))
-                        .stroke(.yellow, style: StrokeStyle(lineWidth: 3, dash: [10, 8]))
+                    DetectionBox(observation: trackedObservation)
+                        .stroke(boxColor(for: boxConfidence), lineWidth: boxLineWidth(for: boxConfidence))
                         .frame(width: rect.width, height: rect.height)
                         .position(x: rect.midX, y: rect.midY)
                 }
 
                 VStack {
-                    HStack {
-                        Spacer()
-
-                        if classificationROI != nil {
-                            Text("ROI locked + smoothed + voted")
-                                .font(.caption)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .background(.black.opacity(0.45))
-                                .foregroundColor(.yellow)
-                                .cornerRadius(10)
-                                .padding(.top, 30)
-                                .padding(.trailing, 20)
-                        }
-                    }
-
                     Spacer()
 
                     Text(poseState.pose.uppercased())
-                        .font(.system(size: 80, weight: .bold))
-                        .foregroundStyle(
-                            LinearGradient(
-                                colors: [.purple, .cyan, .mint],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
-                        )
-                        .shadow(radius: 15)
+                        .font(.system(size: 72, weight: .bold))
+                        .foregroundColor(.white)
+                        .shadow(color: .black.opacity(0.5), radius: 8, x: 0, y: 3)
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.5)
 
-                    Text("Hold: \(poseState.holdTime, specifier: "%.1f")s")
-                        .font(.title3)
-                        .foregroundColor(.white.opacity(0.8))
+                    if poseState.isPoseValid {
+                        Text("Hold: \(poseState.holdTime, specifier: "%.1f")s")
+                            .font(.title3)
+                            .foregroundColor(.white.opacity(0.92))
+
+                        ProgressView(value: poseState.easedProgress)
+                            .progressViewStyle(.linear)
+                            .tint(poseState.progressColor)
+                            .frame(width: min(geo.size.width * 0.5, 420))
+                            .scaleEffect(poseState.progressScale)
+                            .animation(.interpolatingSpring(stiffness: 210, damping: 13), value: poseState.progressScale)
+                    }
+
+                    if poseState.showCompletion {
+                        Text(poseState.completionWord)
+                            .font(.system(size: 42, weight: .heavy))
+                            .foregroundColor(Color(red: 0.69, green: 0.95, blue: 0.82))
+                            .scaleEffect(1.08)
+                            .opacity(0.95)
+                            .transition(.opacity)
+                            .animation(.easeInOut(duration: 0.5).repeatForever(autoreverses: true), value: poseState.showCompletion)
+                    }
 
                     Text(detectionStatus)
                         .font(.headline)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 8)
-                        .background(.black.opacity(0.45))
+                        .background(Color.black.opacity(0.45))
                         .foregroundColor(.white)
                         .cornerRadius(12)
 
                     Spacer()
 
-                    Text("Press Q to quit")
-                        .font(.caption)
-                        .padding(12)
-                        .background(.ultraThinMaterial)
-                        .cornerRadius(18)
-                        .padding(.bottom, 40)
+                    HStack {
+                        Text("Press Q / Й to quit")
+                            .font(.caption)
+                            .foregroundColor(.white.opacity(0.9))
+                            .padding(10)
+                            .background(Color.black.opacity(0.4))
+                            .cornerRadius(10)
+                        Spacer()
+                    }
+                    .padding(.leading, 24)
+                    .padding(.bottom, 28)
                 }
             }
             .ignoresSafeArea()
@@ -188,28 +156,42 @@ struct ContentView: View {
 
     private func classify(buffer: CVPixelBuffer, observation: VNDetectedObjectObservation) {
         let rawROI = expandedROI(from: observation.boundingBox)
+        let stabilizedROI = stabilizeROI(rawROI)
 
-        classifier.classify(buffer: buffer, regionOfInterest: rawROI) { label, confidence in
+        trackedObservation = VNDetectedObjectObservation(boundingBox: stabilizedROI)
+
+        classifier.classify(buffer: buffer, regionOfInterest: stabilizedROI) { label, confidence in
             DispatchQueue.main.async {
-                let stabilized = stabilizeROI(rawROI)
+                boxConfidence = confidence
 
-                trackedObservation = VNDetectedObjectObservation(boundingBox: stabilized)
-                classificationROI = stabilized
-                detectionStatus = "Person detected"
-
-                if confidence >= confidenceThreshold {
-                    pushVote(label)
-                } else {
-                    detectionStatus = "Low confidence (\(String(format: "%.2f", confidence)))"
-                    pushVote("unknown")
+                guard confidence >= confidenceThreshold, label != "unknown", label != "model_missing" else {
+                    detectionStatus = "Uncertain (\(String(format: "%.2f", confidence)))"
+                    voteWindow.removeAll()
+                    pendingPose = nil
+                    poseState.update(newPose: "uncertain")
+                    isProcessingFrame = false
+                    return
                 }
 
-                applyPoseFromVotes()
+                detectionStatus = "Person detected"
+                pushVote(label)
+                if let stablePose = resolvedMajorityPose() {
+                    applyHysteresis(targetPose: stablePose)
+                }
 
-                print("[ContentView] pose=\(label) confidence=\(String(format: "%.2f", confidence)) status=\(detectionStatus)")
                 isProcessingFrame = false
             }
         }
+    }
+
+    private func expandedROI(from bbox: CGRect) -> CGRect {
+        let widthScale: CGFloat = 2.0
+        let heightScale: CGFloat = 2.3
+        let newWidth = min(1, bbox.width * widthScale)
+        let newHeight = min(1, bbox.height * heightScale)
+        let newX = max(0, min(1 - newWidth, bbox.midX - newWidth / 2))
+        let newY = max(0, min(1 - newHeight, bbox.midY - newHeight / 2))
+        return CGRect(x: newX, y: newY, width: newWidth, height: newHeight)
     }
 
     private func stabilizeROI(_ target: CGRect) -> CGRect {
@@ -243,22 +225,14 @@ struct ContentView: View {
         }
     }
 
-    private func applyPoseFromVotes() {
-        let validVotes = voteWindow.filter { $0 != "unknown" && $0 != "no_person" && $0 != "model_missing" }
+    private func resolvedMajorityPose() -> String? {
+        guard voteWindow.count >= majorityMinVotes else { return nil }
+        let grouped = Dictionary(grouping: voteWindow, by: { $0 })
+        guard let winner = grouped.max(by: { $0.value.count < $1.value.count }) else { return nil }
+        return winner.value.count >= majorityMinVotes ? winner.key : nil
+    }
 
-        guard !validVotes.isEmpty else {
-            if poseState.pose != "no_person" {
-                poseState.update(newPose: "no_person")
-            }
-            pendingPose = nil
-            return
-        }
-
-        let grouped = Dictionary(grouping: validVotes, by: { $0 })
-        guard let winner = grouped.max(by: { $0.value.count < $1.value.count }) else { return }
-        guard winner.value.count >= majorityMinVotes else { return }
-
-        let targetPose = winner.key
+    private func applyHysteresis(targetPose: String) {
         let now = Date()
 
         if poseState.pose == targetPose {
@@ -273,9 +247,27 @@ struct ContentView: View {
         }
 
         guard now.timeIntervalSince(pendingPoseSince) >= poseSwitchHysteresis else { return }
-
         poseState.update(newPose: targetPose)
         pendingPose = nil
+    }
+
+    private func boxColor(for confidence: Double) -> Color {
+        let c = max(0, min(1, confidence))
+        if c < 0.5 {
+            let t = c / 0.5
+            return Color(red: 0.73 + (0.98 - 0.73) * t,
+                         green: 0.60 + (0.76 - 0.60) * t,
+                         blue: 0.92 + (0.63 - 0.92) * t)
+        }
+
+        let t = (c - 0.5) / 0.5
+        return Color(red: 0.98 + (0.69 - 0.98) * t,
+                     green: 0.76 + (0.95 - 0.76) * t,
+                     blue: 0.63 + (0.82 - 0.63) * t)
+    }
+
+    private func boxLineWidth(for confidence: Double) -> CGFloat {
+        CGFloat(2 + max(0, min(1, confidence)) * 4)
     }
 
     private func toPreviewRect(normalizedBBox: CGRect, viewSize: CGSize) -> CGRect {

@@ -19,7 +19,6 @@ class FocusTrackingEngine {
 
     func process(buffer: CVPixelBuffer,
                  completion: @escaping (VNDetectedObjectObservation?) -> Void) {
-        // Primary detector: Vision human rectangles gives more stable full-body box.
         detectHuman(buffer: buffer) { humanObservation in
             if let humanObservation {
                 completion(humanObservation)
@@ -36,15 +35,12 @@ class FocusTrackingEngine {
         let request = VNDetectHumanRectanglesRequest { request, _ in
             let humans = request.results as? [VNHumanObservation] ?? []
 
-            guard let best = humans.max(by: {
-                ($0.boundingBox.width * $0.boundingBox.height) <
-                ($1.boundingBox.width * $1.boundingBox.height)
-            }) else {
+            guard let best = self.bestSubject(from: humans.map { $0.boundingBox }) else {
                 completion(nil)
                 return
             }
 
-            let expanded = self.expandForFullBody(best.boundingBox)
+            let expanded = self.expandForFullBody(best)
             completion(VNDetectedObjectObservation(boundingBox: expanded))
         }
 
@@ -73,25 +69,18 @@ class FocusTrackingEngine {
                 return
             }
 
-            let persons = results.filter {
-                $0.labels.first?.identifier.lowercased() == "person"
-            }
+            let persons = results
+                .filter { $0.labels.first?.identifier.lowercased() == "person" }
+                .map(\.boundingBox)
 
-            let candidates = persons.isEmpty ? results : persons
+            let candidates = persons.isEmpty ? results.map(\.boundingBox) : persons
 
-            guard let best = candidates.max(by: {
-                ($0.boundingBox.width * $0.boundingBox.height) <
-                ($1.boundingBox.width * $1.boundingBox.height)
-            }) else {
+            guard let best = self.bestSubject(from: candidates) else {
                 completion(nil)
                 return
             }
 
-            if persons.isEmpty {
-                self.debugLog("YOLO fallback: no explicit 'person' label, using largest object")
-            }
-
-            let expanded = self.expandForFullBody(best.boundingBox)
+            let expanded = self.expandForFullBody(best)
             completion(VNDetectedObjectObservation(boundingBox: expanded))
         }
 
@@ -106,6 +95,21 @@ class FocusTrackingEngine {
         }
     }
 
+    private func bestSubject(from boxes: [CGRect]) -> CGRect? {
+        guard !boxes.isEmpty else { return nil }
+
+        return boxes.max(by: { score(for: $0) < score(for: $1) })
+    }
+
+    private func score(for box: CGRect) -> CGFloat {
+        let centerDistance = hypot(box.midX - 0.5, box.midY - 0.5)
+        let maxDistance = hypot(CGFloat(0.5), CGFloat(0.5))
+        let centerScore = max(0, 1 - centerDistance / maxDistance)
+        let areaScore = min(1, box.width * box.height)
+
+        return centerScore * 0.6 + areaScore * 0.4
+    }
+
     private func expandForFullBody(_ bbox: CGRect) -> CGRect {
         let widthScale: CGFloat = 1.5
         let heightScale: CGFloat = 2.4
@@ -113,7 +117,6 @@ class FocusTrackingEngine {
         let expandedWidth = min(1, bbox.width * widthScale)
         let expandedHeight = min(1, bbox.height * heightScale)
 
-        // Shift center slightly down to include legs when detector is torso-biased.
         let centerX = bbox.midX
         let centerY = bbox.midY - bbox.height * 0.2
 
