@@ -5,6 +5,7 @@ struct FrameOutput {
     let label: String
     let confidence: Float
     let selectedTrack: Track?
+    let debugInfo: String
 }
 
 final class FrameProcessor {
@@ -42,12 +43,24 @@ final class FrameProcessor {
         let height = CVPixelBufferGetHeight(frame)
         let selected = selector.selectBest(from: tracks, frameWidth: width, frameHeight: height)
 
-        if let selected,
-           frameCounter % classifyEveryNFrames == 0,
-           let crop = cropper.crop(frame: frame, bboxXYXY: selected.smoothedBBox) {
-            cachedResult = classifier.classify(cropBuffer: crop)
+        var stage = detector.debugMessage()
+
+        if let selected {
+            stage += " tracks=\(tracks.count) selected=\(selected.id) bbox=\(selected.smoothedBBox.debugDescription)"
+            if frameCounter % classifyEveryNFrames == 0 {
+                if let crop = cropper.crop(frame: frame, bboxXYXY: selected.smoothedBBox) {
+                    cachedResult = classifier.classify(cropBuffer: crop)
+                    stage += " crop=ok classify=\(cachedResult.label):\(String(format: "%.2f", cachedResult.confidence))"
+                } else {
+                    stage += " crop=empty"
+                }
+            } else {
+                stage += " classify=skip(\(frameCounter)%\(classifyEveryNFrames))"
+            }
+        } else {
+            stage += " tracks=\(tracks.count) selected=nil"
         }
 
-        return FrameOutput(label: cachedResult.label, confidence: cachedResult.confidence, selectedTrack: selected)
+        return FrameOutput(label: cachedResult.label, confidence: cachedResult.confidence, selectedTrack: selected, debugInfo: stage)
     }
 }

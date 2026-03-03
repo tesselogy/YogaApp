@@ -11,6 +11,7 @@ struct ContentView: View {
     @State var trackedBBox: CGRect?
     @State var detectionStatus: String = "Waiting for person..."
     @State var isProcessingFrame: Bool = false
+    @State var debugLine: String = "-"
 
     var body: some View {
         GeometryReader { geo in
@@ -35,13 +36,15 @@ struct ContentView: View {
                                         trackedBBox = track.smoothedBBox
                                         detectionStatus = "Person detected (id: \(track.id))"
                                         poseState.update(newPose: output.label)
+                                        debugLine = output.debugInfo
                                     } else {
                                         trackedBBox = nil
                                         detectionStatus = "Person not detected"
                                         poseState.update(newPose: "no_person")
+                                        debugLine = output.debugInfo
                                     }
 
-                                    print("[ContentView] pose=\(output.label) confidence=\(String(format: \"%.2f\", output.confidence)) detection=\(detectionStatus)")
+                                    print("[ContentView] pose=\(output.label) confidence=\(String(format: "%.2f", output.confidence)) detection=\(detectionStatus) debug=\(output.debugInfo)")
                                     isProcessingFrame = false
                                 }
                             }
@@ -71,7 +74,7 @@ struct ContentView: View {
                         )
                         .shadow(radius: 15)
 
-                    Text("Hold: \(poseState.holdTime, specifier: \"%.1f\")s")
+                    Text("Hold: \(poseState.holdTime, specifier: "%.1f")s")
                         .font(.title3)
                         .foregroundColor(.white.opacity(0.8))
 
@@ -82,6 +85,15 @@ struct ContentView: View {
                         .background(.black.opacity(0.45))
                         .foregroundColor(.white)
                         .cornerRadius(12)
+
+                    Text(debugLine)
+                        .font(.caption2)
+                        .lineLimit(4)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .background(.black.opacity(0.55))
+                        .foregroundColor(.yellow)
+                        .cornerRadius(10)
 
                     Spacer()
                 }
@@ -103,7 +115,7 @@ private struct DetectionBox: Shape {
 
         let scaled = CGRect(
             x: rect.minX * sx,
-            y: rect.minY * sy,
+            y: (CGFloat(frameHeight) - rect.maxY) * sy,
             width: rect.width * sx,
             height: rect.height * sy
         )
