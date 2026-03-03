@@ -97,7 +97,8 @@ final class YOLODetector {
 
             let actualFormat = CVPixelBufferGetPixelFormatType(frame)
             let preparedFormat = CVPixelBufferGetPixelFormatType(prepared.buffer)
-            lastDebugMessage = "fmt=\(pixelFormatName(actualFormat))->\(pixelFormatName(preparedFormat)) size=\(prepared.frameWidth)x\(prepared.frameHeight)->\(prepared.modelWidth)x\(prepared.modelHeight) outputs=[\(shapeInfo)] all=\(result.all.count) person=\(result.persons.count) nms=\(result.nms.count)"
+            let maxPersonConf = result.persons.map(\.confidence).max() ?? 0
+            lastDebugMessage = "fmt=\(pixelFormatName(actualFormat))->\(pixelFormatName(preparedFormat)) size=\(prepared.frameWidth)x\(prepared.frameHeight)->\(prepared.modelWidth)x\(prepared.modelHeight) outputs=[\(shapeInfo)] all=\(result.all.count) person=\(result.persons.count) nms=\(result.nms.count) maxPersonConf=\(String(format: "%.3f", maxPersonConf))"
             return result.nms
         } catch {
             if error.localizedDescription.contains("not in allowed set of image sizes"),
@@ -156,6 +157,7 @@ final class YOLODetector {
                                                frameHeight: frameHeight,
                                                modelWidth: side,
                                                modelHeight: side)
+                let maxPersonConf = result.persons.map(\.confidence).max() ?? 0
 
                 let shapeInfo = outputNames
                     .compactMap { name -> String? in
@@ -164,7 +166,7 @@ final class YOLODetector {
                     }
                     .joined(separator: ",")
 
-                lastDebugMessage = "fallback_size=\(side)x\(side) fmt=\(pixelFormatName(actualFormat))->\(pixelFormatName(CVPixelBufferGetPixelFormatType(candidateBuffer))) outputs=[\(shapeInfo)] all=\(result.all.count) person=\(result.persons.count) nms=\(result.nms.count) after_err=\(originalError.localizedDescription)"
+                lastDebugMessage = "fallback_size=\(side)x\(side) fmt=\(pixelFormatName(actualFormat))->\(pixelFormatName(CVPixelBufferGetPixelFormatType(candidateBuffer))) outputs=[\(shapeInfo)] all=\(result.all.count) person=\(result.persons.count) nms=\(result.nms.count) maxPersonConf=\(String(format: "%.3f", maxPersonConf)) after_err=\(originalError.localizedDescription)"
                 return result.nms
             } catch {
                 continue
@@ -183,6 +185,22 @@ final class YOLODetector {
                                   frameHeight: Int,
                                   modelInputWidth: Int,
                                   modelInputHeight: Int) -> [Detection] {
+        let outputArrays: [String: MLMultiArray] = Dictionary(uniqueKeysWithValues: outputNames.compactMap {
+            guard let m = prediction.featureValue(for: $0)?.multiArrayValue else { return nil }
+            return ($0.lowercased(), m)
+        })
+
+        if let coords = outputArrays.first(where: { $0.key.contains("coord") })?.value,
+           let confs = outputArrays.first(where: { $0.key.contains("conf") })?.value,
+           let decoded = decodeCoordinatesConfidence(coords: coords,
+                                                    confs: confs,
+                                                    frameWidth: frameWidth,
+                                                    frameHeight: frameHeight,
+                                                    modelInputWidth: modelInputWidth,
+                                                    modelInputHeight: modelInputHeight) {
+            return decoded
+        }
+
         let multiArrays: [MLMultiArray] = outputNames.compactMap { prediction.featureValue(for: $0)?.multiArrayValue }
         guard let tensor = multiArrays.max(by: { $0.count < $1.count }) else { return [] }
 
@@ -275,6 +293,75 @@ final class YOLODetector {
 
         lastDebugMessage = "unsupported_tensor_shape=\(shape)"
         return []
+    }
+
+
+    private func decodeCoordinatesConfidence(coords: MLMultiArray,
+                                             confs: MLMultiArray,
+                                             frameWidth: Int,
+                                             frameHeight: Int,
+                                             modelInputWidth: Int,
+                                             modelInputHeight: Int) -> [Detection]? {
+        let coordShape = coords.shape.map { $0.intValue }
+        let confShape = confs.shape.map { $0.intValue }
+
+        guard let coordLast = coordShape.last, coordLast == 4,
+              let confLast = confShape.last, confLast > 0 else {
+            return nil
+        }
+
+        let coordRows = coords.count / 4
+        let confRows = confs.count / confLast
+        let rows = min(coordRows, confRows)
+        guard rows > 0 else { return nil }
+
+        let coordVals = (0..<coords.count).map { coords[$0].floatValue }
+        let confVals = (0..<confs.count).map { confs[$0].floatValue }
+
+        let mapX: Float = (modelInputWidth > 0 && modelInputWidth != frameWidth) ? Float(frameWidth) / Float(modelInputWidth) : 1
+        let mapY: Float = (modelInputHeight > 0 && modelInputHeight != frameHeight) ? Float(frameHeight) / Float(modelInputHeight) : 1
+
+        var detections: [Detection] = []
+        detections.reserveCapacity(rows)
+
+        for r in 0..<rows {
+            let cbase = r * 4
+            let x1raw = coordVals[cbase]
+            let y1raw = coordVals[cbase + 1]
+            let x2raw = coordVals[cbase + 2]
+            let y2raw = coordVals[cbase + 3]
+
+            let normalized = max(abs(x1raw), abs(y1raw), abs(x2raw), abs(y2raw)) <= 2.0
+            let sx: Float = normalized ? Float(frameWidth) : mapX
+            let sy: Float = normalized ? Float(frameHeight) : mapY
+
+            var bestClass = 0
+            var bestScore: Float = -Float.greatestFiniteMagnitude
+            let pbase = r * confLast
+            for c in 0..<confLast {
+                let score = confVals[pbase + c]
+                if score > bestScore {
+                    bestScore = score
+                    bestClass = c
+                }
+            }
+
+            guard bestScore >= confidenceThreshold else { continue }
+
+            let x1 = max(0, min(Float(frameWidth - 1), x1raw * sx))
+            let y1 = max(0, min(Float(frameHeight - 1), y1raw * sy))
+            let x2 = max(0, min(Float(frameWidth - 1), x2raw * sx))
+            let y2 = max(0, min(Float(frameHeight - 1), y2raw * sy))
+            guard x2 > x1, y2 > y1 else { continue }
+
+            detections.append(Detection(
+                bbox: CGRect(x: CGFloat(x1), y: CGFloat(y1), width: CGFloat(x2 - x1), height: CGFloat(y2 - y1)),
+                confidence: bestScore,
+                classIndex: bestClass
+            ))
+        }
+
+        return detections
     }
 
     private func makeInputBufferIfNeeded(from frame: CVPixelBuffer) -> InputPreparation? {
