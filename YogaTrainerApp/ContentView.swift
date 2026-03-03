@@ -1,5 +1,6 @@
 import SwiftUI
 import Foundation
+import CoreImage
 
 struct ContentView: View {
 
@@ -9,6 +10,8 @@ struct ContentView: View {
     private let frameProcessor = FrameProcessor()
 
     @State var trackedBBox: CGRect?
+    @State var classificationBBox: CGRect?
+    @State var classificationCrop: CVPixelBuffer?
     @State var detectionStatus: String = "Waiting for person..."
     @State var isProcessingFrame: Bool = false
     @State var debugLine: String = "-"
@@ -34,12 +37,15 @@ struct ContentView: View {
                                 let output = frameProcessor.process(frame: buffer)
                                 DispatchQueue.main.async {
                                     if let track = output.selectedTrack {
-                                        trackedBBox = output.selectedBBox ?? track.smoothedBBox
+                                        trackedBBox = output.trackingBBox ?? track.smoothedBBox
+                                        classificationBBox = output.selectedBBox
+                                        if let crop = output.classificationCrop { classificationCrop = crop }
                                         detectionStatus = "Person detected (id: \(track.id))"
                                         poseState.update(newPose: output.label)
                                         debugLine = output.debugInfo
                                     } else {
                                         trackedBBox = nil
+                                        classificationBBox = nil
                                         detectionStatus = "Person not detected"
                                         poseState.update(newPose: "no_person")
                                         debugLine = output.debugInfo
@@ -59,6 +65,35 @@ struct ContentView: View {
                                  frameHeight: CVPixelBufferGetHeight(buffer))
                         .stroke(.green, lineWidth: 4)
                         .frame(width: geo.size.width, height: geo.size.height)
+                }
+
+                if let classificationBBox,
+                   let buffer = camera.currentBuffer {
+                    DetectionBox(rect: classificationBBox,
+                                 frameWidth: CVPixelBufferGetWidth(buffer),
+                                 frameHeight: CVPixelBufferGetHeight(buffer))
+                        .stroke(.yellow, style: StrokeStyle(lineWidth: 3, dash: [10, 8]))
+                        .frame(width: geo.size.width, height: geo.size.height)
+                }
+
+
+                VStack {
+                    HStack {
+                        Spacer()
+                        if let classificationCrop,
+                           let image = cropPreviewImage(from: classificationCrop) {
+                            Image(decorative: image, scale: 1.0)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 120, height: 160)
+                                .clipped()
+                                .overlay(RoundedRectangle(cornerRadius: 10).stroke(.yellow, lineWidth: 2))
+                                .cornerRadius(10)
+                                .padding(.trailing, 14)
+                                .padding(.top, 22)
+                        }
+                    }
+                    Spacer()
                 }
 
                 VStack {
@@ -102,6 +137,13 @@ struct ContentView: View {
             .ignoresSafeArea()
         }
     }
+}
+
+private let cropPreviewContext = CIContext(options: [.useSoftwareRenderer: false])
+
+private func cropPreviewImage(from buffer: CVPixelBuffer) -> CGImage? {
+    let ci = CIImage(cvPixelBuffer: buffer)
+    return cropPreviewContext.createCGImage(ci, from: ci.extent)
 }
 
 private struct DetectionBox: Shape {
