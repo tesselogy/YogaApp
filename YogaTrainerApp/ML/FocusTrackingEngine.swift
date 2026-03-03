@@ -7,6 +7,8 @@ class FocusTrackingEngine {
     private var detectionModel: VNCoreMLModel?
     private var trackingRequest: VNTrackObjectRequest?
     private var lastLogTime: Date = .distantPast
+    private var frameCounter = 0
+    private let redetectInterval = 6
 
     init() {
         detectionModel = Self.loadModel(named: "yolov8n")
@@ -21,6 +23,14 @@ class FocusTrackingEngine {
     func process(buffer: CVPixelBuffer,
                  completion: @escaping (VNDetectedObjectObservation?) -> Void) {
 
+        frameCounter += 1
+        let shouldRedetect = frameCounter % redetectInterval == 0
+
+        if shouldRedetect {
+            trackingRequest = nil
+            debugLog("Periodic re-detection to avoid box shrink/drift")
+        }
+
         if let trackingRequest = trackingRequest {
             let handler = VNImageRequestHandler(cvPixelBuffer: buffer)
             do {
@@ -29,12 +39,14 @@ class FocusTrackingEngine {
                 debugLog("Tracking request failed: \(error.localizedDescription)")
             }
 
-            if let result = trackingRequest.results?.first as? VNDetectedObjectObservation {
+            if let result = trackingRequest.results?.first as? VNDetectedObjectObservation,
+               result.confidence > 0.25,
+               (result.boundingBox.width * result.boundingBox.height) > 0.02 {
                 debugLog("Tracking person with confidence: \(String(format: "%.2f", result.confidence))")
                 completion(result)
                 return
             } else {
-                debugLog("Tracking lost target, running detection again")
+                debugLog("Tracking lost/too small target, running detection again")
                 self.trackingRequest = nil
             }
         }
@@ -58,9 +70,6 @@ class FocusTrackingEngine {
                 self.detectHumanFallback(buffer: buffer, completion: completion)
                 return
             }
-
-            let topLabels = results.prefix(3).compactMap { $0.labels.first?.identifier }.joined(separator: ",")
-            self.debugLog("Detection objects: \(results.count), top labels: [\(topLabels)]")
 
             let persons = results.filter {
                 $0.labels.first?.identifier.lowercased() == "person"

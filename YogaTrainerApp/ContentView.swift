@@ -13,6 +13,16 @@ struct ContentView: View {
     @State var trackedObservation: VNDetectedObjectObservation?
     @State var detectionStatus: String = "Waiting for person..."
 
+    private func expandedROI(from bbox: CGRect) -> CGRect {
+        let scale: CGFloat = 1.35
+        let newWidth = min(1, bbox.width * scale)
+        let newHeight = min(1, bbox.height * scale)
+        let newX = max(0, min(1 - newWidth, bbox.midX - newWidth / 2))
+        let newY = max(0, min(1 - newHeight, bbox.midY - newHeight / 2))
+        return CGRect(x: newX, y: newY, width: newWidth, height: newHeight)
+    }
+
+
     var body: some View {
 
         GeometryReader { geo in
@@ -39,7 +49,7 @@ struct ContentView: View {
                                     return
                                 }
 
-                                classifier.classify(buffer: buffer, regionOfInterest: obs.boundingBox) { label, confidence in
+                                classifier.classify(buffer: buffer, regionOfInterest: expandedROI(from: obs.boundingBox)) { label, confidence in
                                     DispatchQueue.main.async {
                                         poseState.update(newPose: label)
                                         print("[ContentView] pose=\(label) confidence=\(String(format: "%.2f", confidence)) detection=\(detectionStatus)")
