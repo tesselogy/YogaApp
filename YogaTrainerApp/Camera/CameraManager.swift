@@ -1,5 +1,5 @@
 import AVFoundation
-import SwiftUI
+import Combine
 
 class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
