@@ -4,7 +4,7 @@ import CoreVideo
 import CoreImage
 
 struct Detection {
-    let bbox: CGRect // pixel xyxy stored as CGRect(x:x1,y:y1,width:x2-x1,height:y2-y1)
+    let bbox: CGRect // pixel xyxy
     let confidence: Float
     let classIndex: Int
 }
@@ -15,6 +15,9 @@ private struct InputPreparation {
     let modelHeight: Int
     let frameWidth: Int
     let frameHeight: Int
+    let scale: Float
+    let padX: Float
+    let padY: Float
 }
 
 final class YOLODetector {
@@ -75,116 +78,64 @@ final class YOLODetector {
 
     func detectPersons(in frame: CVPixelBuffer) -> [Detection] {
         guard let prepared = makeInputBufferIfNeeded(from: frame) else {
-            let actualFormat = CVPixelBufferGetPixelFormatType(frame)
-            let expectedSize = expectedModelSizeDescription()
-            lastDebugMessage = "input_prepare_failed expected_fmt=\(pixelFormatName(inputConstraint?.pixelFormatType ?? 0)) actual_fmt=\(pixelFormatName(actualFormat)) expected_size=\(expectedSize) actual_size=\(CVPixelBufferGetWidth(frame))x\(CVPixelBufferGetHeight(frame))"
+            lastDebugMessage = "input_prepare_failed"
             return []
         }
 
         do {
-            let result = try runPrediction(buffer: prepared.buffer,
-                                           frameWidth: prepared.frameWidth,
-                                           frameHeight: prepared.frameHeight,
-                                           modelWidth: prepared.modelWidth,
-                                           modelHeight: prepared.modelHeight)
+            let result = try runPrediction(prepared: prepared)
+            let shapeInfo = outputNames.compactMap { name -> String? in
+                guard let m = result.prediction.featureValue(for: name)?.multiArrayValue else { return nil }
+                return "\(name):\(m.shape.map { $0.intValue })"
+            }.joined(separator: ",")
 
-            let shapeInfo = outputNames
-                .compactMap { name -> String? in
-                    guard let m = result.prediction.featureValue(for: name)?.multiArrayValue else { return nil }
-                    return "\(name):\(m.shape.map{$0.intValue})"
-                }
-                .joined(separator: ",")
-
-            let actualFormat = CVPixelBufferGetPixelFormatType(frame)
-            let preparedFormat = CVPixelBufferGetPixelFormatType(prepared.buffer)
             let maxPersonConf = result.persons.map(\.confidence).max() ?? 0
-            lastDebugMessage = "fmt=\(pixelFormatName(actualFormat))->\(pixelFormatName(preparedFormat)) size=\(prepared.frameWidth)x\(prepared.frameHeight)->\(prepared.modelWidth)x\(prepared.modelHeight) outputs=[\(shapeInfo)] all=\(result.all.count) person=\(result.persons.count) nms=\(result.nms.count) maxPersonConf=\(String(format: "%.3f", maxPersonConf))"
+            lastDebugMessage = "fmt=\(pixelFormatName(CVPixelBufferGetPixelFormatType(frame)))->\(pixelFormatName(CVPixelBufferGetPixelFormatType(prepared.buffer))) size=\(prepared.frameWidth)x\(prepared.frameHeight)->\(prepared.modelWidth)x\(prepared.modelHeight) norm(scale=\(String(format: "%.4f", prepared.scale)) padX=\(String(format: "%.1f", prepared.padX)) padY=\(String(format: "%.1f", prepared.padY))) outputs=[\(shapeInfo)] all=\(result.all.count) person=\(result.persons.count) nms=\(result.nms.count) maxPersonConf=\(String(format: "%.3f", maxPersonConf))"
             return result.nms
         } catch {
             if error.localizedDescription.contains("not in allowed set of image sizes"),
                let fallback = fallbackPredictionWithCandidateSizes(frame: frame, originalError: error) {
                 return fallback
             }
-
-            let expected = pixelFormatName(inputConstraint?.pixelFormatType ?? 0)
-            let expectedSize = expectedModelSizeDescription()
-            lastDebugMessage = "prediction_failed expected_fmt=\(expected) expected_size=\(expectedSize) err=\(error.localizedDescription)"
+            lastDebugMessage = "prediction_failed err=\(error.localizedDescription)"
             return []
         }
     }
 
+    func debugMessage() -> String { lastDebugMessage }
 
-    private func runPrediction(buffer: CVPixelBuffer,
-                               frameWidth: Int,
-                               frameHeight: Int,
-                               modelWidth: Int,
-                               modelHeight: Int) throws -> (prediction: MLFeatureProvider, all: [Detection], persons: [Detection], nms: [Detection]) {
-        let provider = try MLDictionaryFeatureProvider(dictionary: [inputName: MLFeatureValue(pixelBuffer: buffer)])
+    private func runPrediction(prepared: InputPreparation) throws -> (prediction: MLFeatureProvider, all: [Detection], persons: [Detection], nms: [Detection]) {
+        let provider = try MLDictionaryFeatureProvider(dictionary: [inputName: MLFeatureValue(pixelBuffer: prepared.buffer)])
         let prediction = try model.prediction(from: provider)
 
-        let all = decodeYOLOOutput(
-            prediction: prediction,
-            frameWidth: frameWidth,
-            frameHeight: frameHeight,
-            modelInputWidth: modelWidth,
-            modelInputHeight: modelHeight
-        )
+        let all = decodeYOLOOutput(prediction: prediction, prep: prepared)
         let persons = all.filter { $0.classIndex == personClassIndex }
         let nms = nonMaximumSuppression(persons, iouThreshold: iouThreshold)
-
         return (prediction, all, persons, nms)
     }
 
     private func fallbackPredictionWithCandidateSizes(frame: CVPixelBuffer,
                                                       originalError: Error) -> [Detection]? {
-        let frameWidth = CVPixelBufferGetWidth(frame)
-        let frameHeight = CVPixelBufferGetHeight(frame)
-        let actualFormat = CVPixelBufferGetPixelFormatType(frame)
-
         let candidates = [192, 224, 256, 320, 384, 416, 448, 512, 576, 608, 640, 672, 704, 736, 768, 800, 960, 1024, 1280]
-
         for side in candidates {
-            guard let candidateBuffer = resizeBuffer(frame: frame,
-                                                     targetWidth: side,
-                                                     targetHeight: side,
-                                                     targetFormat: inputConstraint?.pixelFormatType ?? actualFormat) else {
-                continue
-            }
-
+            guard let prepared = makePreparedBuffer(from: frame,
+                                                    targetWidth: side,
+                                                    targetHeight: side,
+                                                    targetFormat: inputConstraint?.pixelFormatType ?? CVPixelBufferGetPixelFormatType(frame),
+                                                    letterbox: true) else { continue }
             do {
-                let result = try runPrediction(buffer: candidateBuffer,
-                                               frameWidth: frameWidth,
-                                               frameHeight: frameHeight,
-                                               modelWidth: side,
-                                               modelHeight: side)
+                let result = try runPrediction(prepared: prepared)
                 let maxPersonConf = result.persons.map(\.confidence).max() ?? 0
-
-                let shapeInfo = outputNames
-                    .compactMap { name -> String? in
-                        guard let m = result.prediction.featureValue(for: name)?.multiArrayValue else { return nil }
-                        return "\(name):\(m.shape.map{$0.intValue})"
-                    }
-                    .joined(separator: ",")
-
-                lastDebugMessage = "fallback_size=\(side)x\(side) fmt=\(pixelFormatName(actualFormat))->\(pixelFormatName(CVPixelBufferGetPixelFormatType(candidateBuffer))) outputs=[\(shapeInfo)] all=\(result.all.count) person=\(result.persons.count) nms=\(result.nms.count) maxPersonConf=\(String(format: "%.3f", maxPersonConf)) after_err=\(originalError.localizedDescription)"
+                lastDebugMessage = "fallback_size=\(side)x\(side) all=\(result.all.count) person=\(result.persons.count) nms=\(result.nms.count) maxPersonConf=\(String(format: "%.3f", maxPersonConf)) after_err=\(originalError.localizedDescription)"
                 return result.nms
             } catch {
                 continue
             }
         }
-
         return nil
     }
 
-    func debugMessage() -> String {
-        lastDebugMessage
-    }
-
-    private func decodeYOLOOutput(prediction: MLFeatureProvider,
-                                  frameWidth: Int,
-                                  frameHeight: Int,
-                                  modelInputWidth: Int,
-                                  modelInputHeight: Int) -> [Detection] {
+    private func decodeYOLOOutput(prediction: MLFeatureProvider, prep: InputPreparation) -> [Detection] {
         let outputArrays: [String: MLMultiArray] = Dictionary(uniqueKeysWithValues: outputNames.compactMap {
             guard let m = prediction.featureValue(for: $0)?.multiArrayValue else { return nil }
             return ($0.lowercased(), m)
@@ -192,39 +143,32 @@ final class YOLODetector {
 
         if let coords = outputArrays.first(where: { $0.key.contains("coord") })?.value,
            let confs = outputArrays.first(where: { $0.key.contains("conf") })?.value,
-           let decoded = decodeCoordinatesConfidence(coords: coords,
-                                                    confs: confs,
-                                                    frameWidth: frameWidth,
-                                                    frameHeight: frameHeight,
-                                                    modelInputWidth: modelInputWidth,
-                                                    modelInputHeight: modelInputHeight) {
+           let decoded = decodeCoordinatesConfidence(coords: coords, confs: confs, prep: prep) {
             return decoded
         }
 
         let multiArrays: [MLMultiArray] = outputNames.compactMap { prediction.featureValue(for: $0)?.multiArrayValue }
         guard let tensor = multiArrays.max(by: { $0.count < $1.count }) else { return [] }
-
         let shape = tensor.shape.map { $0.intValue }
         let values = (0..<tensor.count).map { tensor[$0].floatValue }
 
-        // Case A: [1,84,8400] or [84,8400]
+        // [1,84,N] / [84,N]
         if (shape.count == 3 && shape[1] > 5) || (shape.count == 2 && shape[0] > 5) {
             let channels = shape.count == 3 ? shape[1] : shape[0]
             let anchors = shape.count == 3 ? shape[2] : shape[1]
             let classCount = channels - 4
             var detections: [Detection] = []
-            detections.reserveCapacity(anchors)
 
-            for anchor in 0..<anchors {
-                let cx = values[0 * anchors + anchor]
-                let cy = values[1 * anchors + anchor]
-                let w = values[2 * anchors + anchor]
-                let h = values[3 * anchors + anchor]
+            for a in 0..<anchors {
+                let cx = values[a]
+                let cy = values[anchors + a]
+                let w = values[2 * anchors + a]
+                let h = values[3 * anchors + a]
 
                 var bestClass = 0
                 var bestScore: Float = 0
                 for c in 0..<classCount {
-                    let score = values[(4 + c) * anchors + anchor]
+                    let score = values[(4 + c) * anchors + a]
                     if score > bestScore {
                         bestScore = score
                         bestClass = c
@@ -233,33 +177,22 @@ final class YOLODetector {
                 guard bestScore >= confidenceThreshold else { continue }
 
                 let normalized = max(abs(cx), abs(cy), abs(w), abs(h)) <= 2.0
-                let mapX: Float = (modelInputWidth > 0 && modelInputWidth != frameWidth) ? Float(frameWidth) / Float(modelInputWidth) : 1
-                let mapY: Float = (modelInputHeight > 0 && modelInputHeight != frameHeight) ? Float(frameHeight) / Float(modelInputHeight) : 1
+                let x1m = normalized ? (cx - w / 2) * Float(prep.modelWidth) : (cx - w / 2)
+                let y1m = normalized ? (cy - h / 2) * Float(prep.modelHeight) : (cy - h / 2)
+                let x2m = normalized ? (cx + w / 2) * Float(prep.modelWidth) : (cx + w / 2)
+                let y2m = normalized ? (cy + h / 2) * Float(prep.modelHeight) : (cy + h / 2)
 
-                let sx: Float = normalized ? Float(frameWidth) : mapX
-                let sy: Float = normalized ? Float(frameHeight) : mapY
-
-                let x1 = max(0, min(Float(frameWidth - 1), (cx - w / 2) * sx))
-                let y1 = max(0, min(Float(frameHeight - 1), (cy - h / 2) * sy))
-                let x2 = max(0, min(Float(frameWidth - 1), (cx + w / 2) * sx))
-                let y2 = max(0, min(Float(frameHeight - 1), (cy + h / 2) * sy))
-                guard x2 > x1, y2 > y1 else { continue }
-
-                detections.append(Detection(
-                    bbox: CGRect(x: CGFloat(x1), y: CGFloat(y1), width: CGFloat(x2 - x1), height: CGFloat(y2 - y1)),
-                    confidence: bestScore,
-                    classIndex: bestClass
-                ))
+                if let box = mapModelBoxToFrame(x1m, y1m, x2m, y2m, prep: prep) {
+                    detections.append(Detection(bbox: box, confidence: bestScore, classIndex: bestClass))
+                }
             }
             return detections
         }
 
-        // Case B: [N,6] / [1,N,6] => x1,y1,x2,y2,conf,class
-        let flat6 = shape.last == 6
-        if flat6 {
+        // [N,6] x1,y1,x2,y2,conf,class
+        if shape.last == 6 {
             let rows = tensor.count / 6
             var detections: [Detection] = []
-            detections.reserveCapacity(rows)
             for r in 0..<rows {
                 let base = r * 6
                 let x1raw = values[base]
@@ -271,22 +204,14 @@ final class YOLODetector {
                 guard conf >= confidenceThreshold else { continue }
 
                 let normalized = max(abs(x1raw), abs(y1raw), abs(x2raw), abs(y2raw)) <= 2.0
-                let mapX: Float = (modelInputWidth > 0 && modelInputWidth != frameWidth) ? Float(frameWidth) / Float(modelInputWidth) : 1
-                let mapY: Float = (modelInputHeight > 0 && modelInputHeight != frameHeight) ? Float(frameHeight) / Float(modelInputHeight) : 1
-                let sx: Float = normalized ? Float(frameWidth) : mapX
-                let sy: Float = normalized ? Float(frameHeight) : mapY
+                let x1m = normalized ? x1raw * Float(prep.modelWidth) : x1raw
+                let y1m = normalized ? y1raw * Float(prep.modelHeight) : y1raw
+                let x2m = normalized ? x2raw * Float(prep.modelWidth) : x2raw
+                let y2m = normalized ? y2raw * Float(prep.modelHeight) : y2raw
 
-                let x1 = max(0, min(Float(frameWidth - 1), x1raw * sx))
-                let y1 = max(0, min(Float(frameHeight - 1), y1raw * sy))
-                let x2 = max(0, min(Float(frameWidth - 1), x2raw * sx))
-                let y2 = max(0, min(Float(frameHeight - 1), y2raw * sy))
-                guard x2 > x1, y2 > y1 else { continue }
-
-                detections.append(Detection(
-                    bbox: CGRect(x: CGFloat(x1), y: CGFloat(y1), width: CGFloat(x2 - x1), height: CGFloat(y2 - y1)),
-                    confidence: conf,
-                    classIndex: cls
-                ))
+                if let box = mapModelBoxToFrame(x1m, y1m, x2m, y2m, prep: prep) {
+                    detections.append(Detection(bbox: box, confidence: conf, classIndex: cls))
+                }
             }
             return detections
         }
@@ -295,35 +220,20 @@ final class YOLODetector {
         return []
     }
 
-
     private func decodeCoordinatesConfidence(coords: MLMultiArray,
                                              confs: MLMultiArray,
-                                             frameWidth: Int,
-                                             frameHeight: Int,
-                                             modelInputWidth: Int,
-                                             modelInputHeight: Int) -> [Detection]? {
+                                             prep: InputPreparation) -> [Detection]? {
         let coordShape = coords.shape.map { $0.intValue }
         let confShape = confs.shape.map { $0.intValue }
+        guard coordShape.last == 4, let classes = confShape.last, classes > 0 else { return nil }
 
-        guard let coordLast = coordShape.last, coordLast == 4,
-              let confLast = confShape.last, confLast > 0 else {
-            return nil
-        }
-
-        let coordRows = coords.count / 4
-        let confRows = confs.count / confLast
-        let rows = min(coordRows, confRows)
+        let rows = min(coords.count / 4, confs.count / classes)
         guard rows > 0 else { return nil }
 
         let coordVals = (0..<coords.count).map { coords[$0].floatValue }
         let confVals = (0..<confs.count).map { confs[$0].floatValue }
 
-        let mapX: Float = (modelInputWidth > 0 && modelInputWidth != frameWidth) ? Float(frameWidth) / Float(modelInputWidth) : 1
-        let mapY: Float = (modelInputHeight > 0 && modelInputHeight != frameHeight) ? Float(frameHeight) / Float(modelInputHeight) : 1
-
         var detections: [Detection] = []
-        detections.reserveCapacity(rows)
-
         for r in 0..<rows {
             let cbase = r * 4
             let x1raw = coordVals[cbase]
@@ -331,37 +241,44 @@ final class YOLODetector {
             let x2raw = coordVals[cbase + 2]
             let y2raw = coordVals[cbase + 3]
 
-            let normalized = max(abs(x1raw), abs(y1raw), abs(x2raw), abs(y2raw)) <= 2.0
-            let sx: Float = normalized ? Float(frameWidth) : mapX
-            let sy: Float = normalized ? Float(frameHeight) : mapY
-
             var bestClass = 0
             var bestScore: Float = -Float.greatestFiniteMagnitude
-            let pbase = r * confLast
-            for c in 0..<confLast {
+            let pbase = r * classes
+            for c in 0..<classes {
                 let score = confVals[pbase + c]
                 if score > bestScore {
                     bestScore = score
                     bestClass = c
                 }
             }
-
             guard bestScore >= confidenceThreshold else { continue }
 
-            let x1 = max(0, min(Float(frameWidth - 1), x1raw * sx))
-            let y1 = max(0, min(Float(frameHeight - 1), y1raw * sy))
-            let x2 = max(0, min(Float(frameWidth - 1), x2raw * sx))
-            let y2 = max(0, min(Float(frameHeight - 1), y2raw * sy))
-            guard x2 > x1, y2 > y1 else { continue }
+            let normalized = max(abs(x1raw), abs(y1raw), abs(x2raw), abs(y2raw)) <= 2.0
+            let x1m = normalized ? x1raw * Float(prep.modelWidth) : x1raw
+            let y1m = normalized ? y1raw * Float(prep.modelHeight) : y1raw
+            let x2m = normalized ? x2raw * Float(prep.modelWidth) : x2raw
+            let y2m = normalized ? y2raw * Float(prep.modelHeight) : y2raw
 
-            detections.append(Detection(
-                bbox: CGRect(x: CGFloat(x1), y: CGFloat(y1), width: CGFloat(x2 - x1), height: CGFloat(y2 - y1)),
-                confidence: bestScore,
-                classIndex: bestClass
-            ))
+            if let box = mapModelBoxToFrame(x1m, y1m, x2m, y2m, prep: prep) {
+                detections.append(Detection(bbox: box, confidence: bestScore, classIndex: bestClass))
+            }
         }
-
         return detections
+    }
+
+    private func mapModelBoxToFrame(_ x1m: Float, _ y1m: Float, _ x2m: Float, _ y2m: Float, prep: InputPreparation) -> CGRect? {
+        let x1f = (x1m - prep.padX) / prep.scale
+        let y1f = (y1m - prep.padY) / prep.scale
+        let x2f = (x2m - prep.padX) / prep.scale
+        let y2f = (y2m - prep.padY) / prep.scale
+
+        let x1 = max(0, min(Float(prep.frameWidth - 1), x1f))
+        let y1 = max(0, min(Float(prep.frameHeight - 1), y1f))
+        let x2 = max(0, min(Float(prep.frameWidth - 1), x2f))
+        let y2 = max(0, min(Float(prep.frameHeight - 1), y2f))
+        guard x2 > x1, y2 > y1 else { return nil }
+
+        return CGRect(x: CGFloat(x1), y: CGFloat(y1), width: CGFloat(x2 - x1), height: CGFloat(y2 - y1))
     }
 
     private func makeInputBufferIfNeeded(from frame: CVPixelBuffer) -> InputPreparation? {
@@ -369,62 +286,48 @@ final class YOLODetector {
         let frameHeight = CVPixelBufferGetHeight(frame)
 
         guard let inputConstraint else {
-            return InputPreparation(buffer: frame, modelWidth: frameWidth, modelHeight: frameHeight, frameWidth: frameWidth, frameHeight: frameHeight)
+            return InputPreparation(buffer: frame,
+                                    modelWidth: frameWidth,
+                                    modelHeight: frameHeight,
+                                    frameWidth: frameWidth,
+                                    frameHeight: frameHeight,
+                                    scale: 1,
+                                    padX: 0,
+                                    padY: 0)
         }
 
         let expectedFormat = inputConstraint.pixelFormatType
         let actualFormat = CVPixelBufferGetPixelFormatType(frame)
+        let modelW = inputConstraint.pixelsWide > 0 ? inputConstraint.pixelsWide : frameWidth
+        let modelH = inputConstraint.pixelsHigh > 0 ? inputConstraint.pixelsHigh : frameHeight
 
-        let expectedWidth = inputConstraint.pixelsWide > 0 ? inputConstraint.pixelsWide : frameWidth
-        let expectedHeight = inputConstraint.pixelsHigh > 0 ? inputConstraint.pixelsHigh : frameHeight
-
-        let needsFormatConversion = expectedFormat != 0 && expectedFormat != actualFormat
-        let needsResize = frameWidth != expectedWidth || frameHeight != expectedHeight
-
-        if !needsFormatConversion && !needsResize {
-            return InputPreparation(buffer: frame, modelWidth: frameWidth, modelHeight: frameHeight, frameWidth: frameWidth, frameHeight: frameHeight)
-        }
-
-        var converted: CVPixelBuffer?
-        let attrs: [CFString: Any] = [
-            kCVPixelBufferCGImageCompatibilityKey: true,
-            kCVPixelBufferCGBitmapContextCompatibilityKey: true
-        ]
-
-        let outputFormat = expectedFormat == 0 ? actualFormat : expectedFormat
-
-        guard CVPixelBufferCreate(kCFAllocatorDefault,
-                                  expectedWidth,
-                                  expectedHeight,
-                                  outputFormat,
-                                  attrs as CFDictionary,
-                                  &converted) == kCVReturnSuccess,
-              let converted else {
-            return nil
-        }
-
-        let ciImage = CIImage(cvPixelBuffer: frame)
-        let sourceRect = CGRect(x: 0, y: 0, width: frameWidth, height: frameHeight)
-        let targetRect = CGRect(x: 0, y: 0, width: expectedWidth, height: expectedHeight)
-        let scaleX = targetRect.width / sourceRect.width
-        let scaleY = targetRect.height / sourceRect.height
-        let resized = ciImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
-        ciContext.render(resized, to: converted)
-
-        return InputPreparation(buffer: converted,
-                                modelWidth: expectedWidth,
-                                modelHeight: expectedHeight,
-                                frameWidth: frameWidth,
-                                frameHeight: frameHeight)
+        return makePreparedBuffer(from: frame,
+                                  targetWidth: modelW,
+                                  targetHeight: modelH,
+                                  targetFormat: expectedFormat == 0 ? actualFormat : expectedFormat,
+                                  letterbox: true)
     }
 
+    private func makePreparedBuffer(from frame: CVPixelBuffer,
+                                    targetWidth: Int,
+                                    targetHeight: Int,
+                                    targetFormat: OSType,
+                                    letterbox: Bool) -> InputPreparation? {
+        let frameWidth = CVPixelBufferGetWidth(frame)
+        let frameHeight = CVPixelBufferGetHeight(frame)
+        let inFormat = CVPixelBufferGetPixelFormatType(frame)
+        let outFormat = targetFormat == 0 ? inFormat : targetFormat
 
-    private func resizeBuffer(frame: CVPixelBuffer,
-                              targetWidth: Int,
-                              targetHeight: Int,
-                              targetFormat: OSType) -> CVPixelBuffer? {
-        let actualFormat = CVPixelBufferGetPixelFormatType(frame)
-        let outFormat = targetFormat == 0 ? actualFormat : targetFormat
+        if frameWidth == targetWidth, frameHeight == targetHeight, inFormat == outFormat {
+            return InputPreparation(buffer: frame,
+                                    modelWidth: targetWidth,
+                                    modelHeight: targetHeight,
+                                    frameWidth: frameWidth,
+                                    frameHeight: frameHeight,
+                                    scale: 1,
+                                    padX: 0,
+                                    padY: 0)
+        }
 
         var converted: CVPixelBuffer?
         let attrs: [CFString: Any] = [
@@ -442,22 +345,47 @@ final class YOLODetector {
             return nil
         }
 
-        let srcW = CVPixelBufferGetWidth(frame)
-        let srcH = CVPixelBufferGetHeight(frame)
         let ciImage = CIImage(cvPixelBuffer: frame)
-        let scaleX = CGFloat(targetWidth) / CGFloat(srcW)
-        let scaleY = CGFloat(targetHeight) / CGFloat(srcH)
-        let resized = ciImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
-        ciContext.render(resized, to: converted)
-        return converted
-    }
 
-    private func expectedModelSizeDescription() -> String {
-        guard let inputConstraint else { return "flexible" }
-        if inputConstraint.pixelsWide > 0 && inputConstraint.pixelsHigh > 0 {
-            return "\(inputConstraint.pixelsWide)x\(inputConstraint.pixelsHigh)"
+        if letterbox {
+            let scale = min(CGFloat(targetWidth) / CGFloat(frameWidth), CGFloat(targetHeight) / CGFloat(frameHeight))
+            let resizedW = CGFloat(frameWidth) * scale
+            let resizedH = CGFloat(frameHeight) * scale
+            let padX = (CGFloat(targetWidth) - resizedW) / 2
+            let padY = (CGFloat(targetHeight) - resizedH) / 2
+
+            // gray fill like Ultralytics letterbox
+            let bg = CIImage(color: CIColor(red: 0.447, green: 0.447, blue: 0.447, alpha: 1))
+                .cropped(to: CGRect(x: 0, y: 0, width: targetWidth, height: targetHeight))
+
+            let resized = ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+                .transformed(by: CGAffineTransform(translationX: padX, y: padY))
+            let composed = resized.composited(over: bg)
+            ciContext.render(composed, to: converted)
+
+            return InputPreparation(buffer: converted,
+                                    modelWidth: targetWidth,
+                                    modelHeight: targetHeight,
+                                    frameWidth: frameWidth,
+                                    frameHeight: frameHeight,
+                                    scale: Float(scale),
+                                    padX: Float(padX),
+                                    padY: Float(padY))
+        } else {
+            let scaleX = CGFloat(targetWidth) / CGFloat(frameWidth)
+            let scaleY = CGFloat(targetHeight) / CGFloat(frameHeight)
+            let resized = ciImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+            ciContext.render(resized, to: converted)
+
+            return InputPreparation(buffer: converted,
+                                    modelWidth: targetWidth,
+                                    modelHeight: targetHeight,
+                                    frameWidth: frameWidth,
+                                    frameHeight: frameHeight,
+                                    scale: Float(scaleX),
+                                    padX: 0,
+                                    padY: 0)
         }
-        return "flexible"
     }
 
     private func pixelFormatName(_ type: OSType) -> String {
