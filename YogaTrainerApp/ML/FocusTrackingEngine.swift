@@ -5,10 +5,7 @@ import Foundation
 class FocusTrackingEngine {
 
     private var detectionModel: VNCoreMLModel?
-    private var trackingRequest: VNTrackObjectRequest?
     private var lastLogTime: Date = .distantPast
-    private var frameCounter = 0
-    private let redetectInterval = 6
 
     init() {
         detectionModel = Self.loadModel(named: "yolov8n")
@@ -22,35 +19,7 @@ class FocusTrackingEngine {
 
     func process(buffer: CVPixelBuffer,
                  completion: @escaping (VNDetectedObjectObservation?) -> Void) {
-
-        frameCounter += 1
-        let shouldRedetect = frameCounter % redetectInterval == 0
-
-        if shouldRedetect {
-            trackingRequest = nil
-            debugLog("Periodic re-detection to avoid box shrink/drift")
-        }
-
-        if let trackingRequest = trackingRequest {
-            let handler = VNImageRequestHandler(cvPixelBuffer: buffer)
-            do {
-                try handler.perform([trackingRequest])
-            } catch {
-                debugLog("Tracking request failed: \(error.localizedDescription)")
-            }
-
-            if let result = trackingRequest.results?.first as? VNDetectedObjectObservation,
-               result.confidence > 0.25,
-               (result.boundingBox.width * result.boundingBox.height) > 0.02 {
-                debugLog("Tracking person with confidence: \(String(format: "%.2f", result.confidence))")
-                completion(result)
-                return
-            } else {
-                debugLog("Tracking lost/too small target, running detection again")
-                self.trackingRequest = nil
-            }
-        }
-
+        // Always redetect on every frame to avoid tracker box shrinking/drifting to chest.
         detect(buffer: buffer, completion: completion)
     }
 
@@ -89,7 +58,6 @@ class FocusTrackingEngine {
                 self.debugLog("No explicit 'person' label, using largest detected object")
             }
 
-            self.startTracking(with: best)
             completion(best)
         }
 
@@ -119,9 +87,7 @@ class FocusTrackingEngine {
             }
 
             self.debugLog("Vision human fallback detected person")
-            let observation = VNDetectedObjectObservation(boundingBox: best.boundingBox)
-            self.startTracking(with: observation)
-            completion(observation)
+            completion(VNDetectedObjectObservation(boundingBox: best.boundingBox))
         }
 
         let handler = VNImageRequestHandler(cvPixelBuffer: buffer)
@@ -131,12 +97,6 @@ class FocusTrackingEngine {
             debugLog("Vision human fallback failed: \(error.localizedDescription)")
             completion(nil)
         }
-    }
-
-    private func startTracking(with observation: VNDetectedObjectObservation) {
-        let tracking = VNTrackObjectRequest(detectedObjectObservation: observation)
-        tracking.trackingLevel = .accurate
-        self.trackingRequest = tracking
     }
 
     private static func loadModel(named name: String) -> VNCoreMLModel? {
