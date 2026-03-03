@@ -11,6 +11,7 @@ struct ContentView: View {
     let classifier = ClassificationEngine()
 
     @State var trackedObservation: VNDetectedObjectObservation?
+    @State var classificationROI: CGRect?
     @State var detectionStatus: String = "Waiting for person..."
 
     private func expandedROI(from bbox: CGRect) -> CGRect {
@@ -21,7 +22,6 @@ struct ContentView: View {
         let newY = max(0, min(1 - newHeight, bbox.midY - newHeight / 2))
         return CGRect(x: newX, y: newY, width: newWidth, height: newHeight)
     }
-
 
     var body: some View {
 
@@ -43,13 +43,20 @@ struct ContentView: View {
 
                                 guard let obs else {
                                     DispatchQueue.main.async {
+                                        classificationROI = nil
                                         poseState.update(newPose: "no_person")
                                         print("[ContentView] skip classify: no person detected")
                                     }
                                     return
                                 }
 
-                                classifier.classify(buffer: buffer, regionOfInterest: expandedROI(from: obs.boundingBox)) { label, confidence in
+                                let roi = expandedROI(from: obs.boundingBox)
+
+                                DispatchQueue.main.async {
+                                    classificationROI = roi
+                                }
+
+                                classifier.classify(buffer: buffer, regionOfInterest: roi) { label, confidence in
                                     DispatchQueue.main.async {
                                         poseState.update(newPose: label)
                                         print("[ContentView] pose=\(label) confidence=\(String(format: "%.2f", confidence)) detection=\(detectionStatus)")
@@ -72,7 +79,36 @@ struct ContentView: View {
                         )
                 }
 
+                if let classificationROI {
+                    DetectionBox(observation: VNDetectedObjectObservation(boundingBox: classificationROI))
+                        .stroke(.yellow, style: StrokeStyle(lineWidth: 3, dash: [10, 8]))
+                        .frame(
+                            width: classificationROI.width * geo.size.width,
+                            height: classificationROI.height * geo.size.height
+                        )
+                        .position(
+                            x: classificationROI.midX * geo.size.width,
+                            y: (1 - classificationROI.midY) * geo.size.height
+                        )
+                }
+
                 VStack {
+                    HStack {
+                        Spacer()
+
+                        if classificationROI != nil {
+                            Text("Yellow dashed box = ROI for classify")
+                                .font(.caption)
+                                .padding(.horizontal, 10)
+                                .padding(.vertical, 6)
+                                .background(.black.opacity(0.45))
+                                .foregroundColor(.yellow)
+                                .cornerRadius(10)
+                                .padding(.top, 30)
+                                .padding(.trailing, 20)
+                        }
+                    }
+
                     Spacer()
 
                     Text(poseState.pose.uppercased())
