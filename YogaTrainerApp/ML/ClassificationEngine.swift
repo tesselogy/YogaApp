@@ -1,5 +1,6 @@
 import Vision
 import CoreML
+import Foundation
 
 class ClassificationEngine {
 
@@ -7,6 +8,12 @@ class ClassificationEngine {
 
     init() {
         model = Self.loadModel(named: "best")
+
+        if model == nil {
+            print("[ClassificationEngine] Classifier model missing: best.mlmodelc was not found in app bundle")
+        } else {
+            print("[ClassificationEngine] Classifier model loaded successfully")
+        }
     }
 
     func classify(buffer: CVPixelBuffer,
@@ -23,12 +30,18 @@ class ClassificationEngine {
 
                 completion(first.identifier, Double(first.confidence))
             } else {
+                print("[ClassificationEngine] No classification result, returning 'unknown'")
                 completion("unknown", 0)
             }
         }
 
         let handler = VNImageRequestHandler(cvPixelBuffer: buffer)
-        try? handler.perform([request])
+        do {
+            try handler.perform([request])
+        } catch {
+            print("[ClassificationEngine] Classification failed: \(error.localizedDescription)")
+            completion("unknown", 0)
+        }
     }
 
     private static func loadModel(named name: String) -> VNCoreMLModel? {
