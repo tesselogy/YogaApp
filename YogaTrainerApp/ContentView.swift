@@ -17,7 +17,24 @@ struct ContentView: View {
     @State private var frameCounter: Int = 0
     @State private var imageSize: CGSize = .zero
 
+    // Pipeline stabilizers
+    @State private var lastInferenceAt: Date = .distantPast
+    @State private var lockedObservation: VNDetectedObjectObservation?
+    @State private var focusLockUntil: Date = .distantPast
+    @State private var smoothedROI: CGRect?
+    @State private var voteWindow: [String] = []
+    @State private var pendingPose: String?
+    @State private var pendingPoseSince: Date = .distantPast
+
     private let processingQueue = DispatchQueue(label: "vision.processing.queue", qos: .userInitiated)
+
+    private let targetInferenceFPS: Double = 10
+    private let confidenceThreshold: Double = 0.6
+    private let majorityWindowSize: Int = 7
+    private let majorityMinVotes: Int = 4
+    private let focusLockDuration: TimeInterval = 2.0
+    private let poseSwitchHysteresis: TimeInterval = 0.45
+    private let roiInterpolationAlpha: CGFloat = 0.35
 
     private func expandedROI(from bbox: CGRect) -> CGRect {
         let widthScale: CGFloat = 2.0
@@ -40,33 +57,55 @@ struct ContentView: View {
                         guard let buffer = newBuffer else { return }
                         guard !isProcessingFrame else { return }
 
+                        let now = Date()
+                        let minInterval = 1.0 / targetInferenceFPS
+                        guard now.timeIntervalSince(lastInferenceAt) >= minInterval else { return }
+                        lastInferenceAt = now
+
                         imageSize = CGSize(width: CVPixelBufferGetWidth(buffer),
                                            height: CVPixelBufferGetHeight(buffer))
 
                         isProcessingFrame = true
                         frameCounter += 1
 
-                        let cachedObservation = trackedObservation
-                        let shouldRedetect = cachedObservation == nil || frameCounter % 3 == 0
+                        let lastLockedObservation = lockedObservation
+                        let currentlyLockedObservation = (now < focusLockUntil) ? lastLockedObservation : nil
+                        let shouldRedetect = currentlyLockedObservation == nil && (lastLockedObservation == nil || frameCounter % 3 == 0)
 
                         processingQueue.async {
                             if shouldRedetect {
                                 focusEngine.process(buffer: buffer) { obs in
                                     guard let obs else {
                                         DispatchQueue.main.async {
-                                            trackedObservation = nil
-                                            classificationROI = nil
-                                            detectionStatus = "Person not detected"
-                                            poseState.update(newPose: "no_person")
-                                            isProcessingFrame = false
+                                            if let lockObs = lockedObservation, Date() < focusLockUntil {
+                                                classify(buffer: buffer, observation: lockObs)
+                                            } else {
+                                                trackedObservation = nil
+                                                classificationROI = nil
+                                                smoothedROI = nil
+                                                detectionStatus = "Person not detected"
+                                                pushVote("unknown")
+                                                applyPoseFromVotes()
+                                                isProcessingFrame = false
+                                            }
                                         }
                                         return
                                     }
 
-                                    classify(buffer: buffer, observation: obs)
+                                    DispatchQueue.main.async {
+                                        lockedObservation = obs
+                                        focusLockUntil = Date().addingTimeInterval(focusLockDuration)
+                                        classify(buffer: buffer, observation: obs)
+                                    }
                                 }
-                            } else if let cachedObservation {
-                                classify(buffer: buffer, observation: cachedObservation)
+                            } else if let lockObs = currentlyLockedObservation {
+                                DispatchQueue.main.async {
+                                    classify(buffer: buffer, observation: lockObs)
+                                }
+                            } else if let lastObs = lastLockedObservation {
+                                DispatchQueue.main.async {
+                                    classify(buffer: buffer, observation: lastObs)
+                                }
                             } else {
                                 DispatchQueue.main.async {
                                     isProcessingFrame = false
@@ -96,7 +135,7 @@ struct ContentView: View {
                         Spacer()
 
                         if classificationROI != nil {
-                            Text("Green + yellow boxes = classify ROI")
+                            Text("ROI locked + smoothed + voted")
                                 .font(.caption)
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 6)
@@ -148,18 +187,95 @@ struct ContentView: View {
     }
 
     private func classify(buffer: CVPixelBuffer, observation: VNDetectedObjectObservation) {
-        let roi = expandedROI(from: observation.boundingBox)
+        let rawROI = expandedROI(from: observation.boundingBox)
 
-        classifier.classify(buffer: buffer, regionOfInterest: roi) { label, confidence in
+        classifier.classify(buffer: buffer, regionOfInterest: rawROI) { label, confidence in
             DispatchQueue.main.async {
-                trackedObservation = VNDetectedObjectObservation(boundingBox: roi)
-                classificationROI = roi
+                let stabilized = stabilizeROI(rawROI)
+
+                trackedObservation = VNDetectedObjectObservation(boundingBox: stabilized)
+                classificationROI = stabilized
                 detectionStatus = "Person detected"
-                poseState.update(newPose: label)
-                print("[ContentView] pose=\(label) confidence=\(String(format: "%.2f", confidence)) detection=\(detectionStatus)")
+
+                if confidence >= confidenceThreshold {
+                    pushVote(label)
+                } else {
+                    detectionStatus = "Low confidence (\(String(format: "%.2f", confidence)))"
+                    pushVote("unknown")
+                }
+
+                applyPoseFromVotes()
+
+                print("[ContentView] pose=\(label) confidence=\(String(format: "%.2f", confidence)) status=\(detectionStatus)")
                 isProcessingFrame = false
             }
         }
+    }
+
+    private func stabilizeROI(_ target: CGRect) -> CGRect {
+        guard let previous = smoothedROI else {
+            smoothedROI = target
+            return target
+        }
+
+        let blended = CGRect(
+            x: previous.origin.x + (target.origin.x - previous.origin.x) * roiInterpolationAlpha,
+            y: previous.origin.y + (target.origin.y - previous.origin.y) * roiInterpolationAlpha,
+            width: previous.width + (target.width - previous.width) * roiInterpolationAlpha,
+            height: previous.height + (target.height - previous.height) * roiInterpolationAlpha
+        )
+
+        let clamped = CGRect(
+            x: max(0, min(1 - blended.width, blended.origin.x)),
+            y: max(0, min(1 - blended.height, blended.origin.y)),
+            width: min(1, max(0.05, blended.width)),
+            height: min(1, max(0.05, blended.height))
+        )
+
+        smoothedROI = clamped
+        return clamped
+    }
+
+    private func pushVote(_ label: String) {
+        voteWindow.append(label)
+        if voteWindow.count > majorityWindowSize {
+            voteWindow.removeFirst(voteWindow.count - majorityWindowSize)
+        }
+    }
+
+    private func applyPoseFromVotes() {
+        let validVotes = voteWindow.filter { $0 != "unknown" && $0 != "no_person" && $0 != "model_missing" }
+
+        guard !validVotes.isEmpty else {
+            if poseState.pose != "no_person" {
+                poseState.update(newPose: "no_person")
+            }
+            pendingPose = nil
+            return
+        }
+
+        let grouped = Dictionary(grouping: validVotes, by: { $0 })
+        guard let winner = grouped.max(by: { $0.value.count < $1.value.count }) else { return }
+        guard winner.value.count >= majorityMinVotes else { return }
+
+        let targetPose = winner.key
+        let now = Date()
+
+        if poseState.pose == targetPose {
+            pendingPose = nil
+            return
+        }
+
+        if pendingPose != targetPose {
+            pendingPose = targetPose
+            pendingPoseSince = now
+            return
+        }
+
+        guard now.timeIntervalSince(pendingPoseSince) >= poseSwitchHysteresis else { return }
+
+        poseState.update(newPose: targetPose)
+        pendingPose = nil
     }
 
     private func toPreviewRect(normalizedBBox: CGRect, viewSize: CGSize) -> CGRect {
