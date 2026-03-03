@@ -17,6 +17,7 @@ class ClassificationEngine {
     }
 
     func classify(buffer: CVPixelBuffer,
+                  regionOfInterest: CGRect? = nil,
                   completion: @escaping (String, Double) -> Void) {
 
         guard let model = model else {
@@ -30,9 +31,12 @@ class ClassificationEngine {
 
                 completion(first.identifier, Double(first.confidence))
             } else {
-                print("[ClassificationEngine] No classification result, returning 'unknown'")
                 completion("unknown", 0)
             }
+        }
+
+        if let roi = regionOfInterest {
+            request.regionOfInterest = roi
         }
 
         let handler = VNImageRequestHandler(cvPixelBuffer: buffer)

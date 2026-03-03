@@ -31,7 +31,15 @@ struct ContentView: View {
                                     detectionStatus = obs == nil ? "Person not detected" : "Person detected"
                                 }
 
-                                classifier.classify(buffer: buffer) { label, confidence in
+                                guard let obs else {
+                                    DispatchQueue.main.async {
+                                        poseState.update(newPose: "no_person")
+                                        print("[ContentView] skip classify: no person detected")
+                                    }
+                                    return
+                                }
+
+                                classifier.classify(buffer: buffer, regionOfInterest: obs.boundingBox) { label, confidence in
                                     DispatchQueue.main.async {
                                         poseState.update(newPose: label)
                                         print("[ContentView] pose=\(label) confidence=\(String(format: "%.2f", confidence)) detection=\(detectionStatus)")

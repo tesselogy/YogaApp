@@ -46,7 +46,7 @@ class FocusTrackingEngine {
                         completion: @escaping (VNDetectedObjectObservation?) -> Void) {
 
         guard let model = detectionModel else {
-            completion(nil)
+            detectHumanFallback(buffer: buffer, completion: completion)
             return
         }
 
@@ -54,8 +54,8 @@ class FocusTrackingEngine {
             let results = request.results as? [VNRecognizedObjectObservation] ?? []
 
             if results.isEmpty {
-                self.debugLog("Detection returned 0 objects")
-                completion(nil)
+                self.debugLog("Detection returned 0 objects, trying Vision human fallback")
+                self.detectHumanFallback(buffer: buffer, completion: completion)
                 return
             }
 
@@ -72,7 +72,7 @@ class FocusTrackingEngine {
                 ($0.boundingBox.width * $0.boundingBox.height) <
                 ($1.boundingBox.width * $1.boundingBox.height)
             }) else {
-                completion(nil)
+                self.detectHumanFallback(buffer: buffer, completion: completion)
                 return
             }
 
@@ -80,10 +80,7 @@ class FocusTrackingEngine {
                 self.debugLog("No explicit 'person' label, using largest detected object")
             }
 
-            let tracking = VNTrackObjectRequest(detectedObjectObservation: best)
-            tracking.trackingLevel = .accurate
-
-            self.trackingRequest = tracking
+            self.startTracking(with: best)
             completion(best)
         }
 
@@ -93,9 +90,44 @@ class FocusTrackingEngine {
         do {
             try handler.perform([request])
         } catch {
-            debugLog("Detection request failed: \(error.localizedDescription)")
+            debugLog("Detection request failed: \(error.localizedDescription), trying Vision human fallback")
+            detectHumanFallback(buffer: buffer, completion: completion)
+        }
+    }
+
+    private func detectHumanFallback(buffer: CVPixelBuffer,
+                                     completion: @escaping (VNDetectedObjectObservation?) -> Void) {
+        let request = VNDetectHumanRectanglesRequest { request, _ in
+            let humans = request.results as? [VNHumanObservation] ?? []
+
+            guard let best = humans.max(by: {
+                ($0.boundingBox.width * $0.boundingBox.height) <
+                ($1.boundingBox.width * $1.boundingBox.height)
+            }) else {
+                self.debugLog("Vision human fallback also found no person")
+                completion(nil)
+                return
+            }
+
+            self.debugLog("Vision human fallback detected person")
+            let observation = VNDetectedObjectObservation(boundingBox: best.boundingBox)
+            self.startTracking(with: observation)
+            completion(observation)
+        }
+
+        let handler = VNImageRequestHandler(cvPixelBuffer: buffer)
+        do {
+            try handler.perform([request])
+        } catch {
+            debugLog("Vision human fallback failed: \(error.localizedDescription)")
             completion(nil)
         }
+    }
+
+    private func startTracking(with observation: VNDetectedObjectObservation) {
+        let tracking = VNTrackObjectRequest(detectedObjectObservation: observation)
+        tracking.trackingLevel = .accurate
+        self.trackingRequest = tracking
     }
 
     private static func loadModel(named name: String) -> VNCoreMLModel? {
