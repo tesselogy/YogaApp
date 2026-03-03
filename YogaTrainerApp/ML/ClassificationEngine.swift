@@ -7,9 +7,6 @@ class ClassificationEngine {
     private var model: VNCoreMLModel?
     private var classLabels: [String] = []
     private var lastLogTime: Date = .distantPast
-    // AVCapture buffers are landscape by default; for portrait UI we need .right
-    // to match the orientation used during training/inference in other prototypes.
-    private let visionOrientation: CGImagePropertyOrientation = .right
 
     init() {
         let loaded = Self.loadModel(named: "best")
@@ -81,15 +78,13 @@ class ClassificationEngine {
             completion("unknown", 0)
         }
 
-        // Most pose classifiers are trained with center-cropped square inputs.
-        // .scaleFit can add large letterboxing and shift logits to wrong classes.
-        request.imageCropAndScaleOption = .centerCrop
+        request.imageCropAndScaleOption = .scaleFit
 
         if let roi {
             request.regionOfInterest = roi
         }
 
-        let handler = VNImageRequestHandler(cvPixelBuffer: buffer, orientation: visionOrientation)
+        let handler = VNImageRequestHandler(cvPixelBuffer: buffer)
         do {
             try handler.perform([request])
         } catch {

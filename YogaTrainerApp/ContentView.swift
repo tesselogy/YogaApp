@@ -15,14 +15,6 @@ struct ContentView: View {
     @State var detectionStatus: String = "Waiting for person..."
     @State var isProcessingFrame: Bool = false
 
-    private func expandedROI(from bbox: CGRect) -> CGRect {
-        let scale: CGFloat = 1.8
-        let newWidth = min(1, bbox.width * scale)
-        let newHeight = min(1, bbox.height * scale)
-        let newX = max(0, min(1 - newWidth, bbox.midX - newWidth / 2))
-        let newY = max(0, min(1 - newHeight, bbox.midY - newHeight / 2))
-        return CGRect(x: newX, y: newY, width: newWidth, height: newHeight)
-    }
 
     var body: some View {
 
@@ -49,7 +41,7 @@ struct ContentView: View {
                                     return
                                 }
 
-                                let roi = expandedROI(from: obs.boundingBox)
+                                let roi = obs.boundingBox
 
                                 classifier.classify(buffer: buffer, regionOfInterest: roi) { label, confidence in
                                     DispatchQueue.main.async {
