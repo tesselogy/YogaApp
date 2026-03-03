@@ -96,7 +96,7 @@ struct ContentView: View {
                         Spacer()
 
                         if classificationROI != nil {
-                            Text("Yellow dashed box = ROI for classify")
+                            Text("Green + yellow boxes = classify ROI")
                                 .font(.caption)
                                 .padding(.horizontal, 10)
                                 .padding(.vertical, 6)
@@ -152,7 +152,7 @@ struct ContentView: View {
 
         classifier.classify(buffer: buffer, regionOfInterest: roi) { label, confidence in
             DispatchQueue.main.async {
-                trackedObservation = observation
+                trackedObservation = VNDetectedObjectObservation(boundingBox: roi)
                 classificationROI = roi
                 detectionStatus = "Person detected"
                 poseState.update(newPose: label)
