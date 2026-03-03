@@ -2,18 +2,18 @@ import Vision
 import CoreML
 import Foundation
 
-struct DetectedPerson {
+struct YTDetectedPerson {
     let id: Int
     let observation: VNDetectedObjectObservation
     let confidence: Double
 }
 
-struct FocusResult {
-    let people: [DetectedPerson]
-    let active: DetectedPerson?
+struct YTFocusResult {
+    let people: [YTDetectedPerson]
+    let active: YTDetectedPerson?
 }
 
-class FocusTrackingEngine {
+class YTFocusTrackingEngine {
 
     private var detectionModel: VNCoreMLModel?
     private var lastLogTime: Date = .distantPast
@@ -21,7 +21,7 @@ class FocusTrackingEngine {
     private var activeTrackID: Int?
     private var focusLockUntil: Date?
     private var nextID: Int = 1
-    private var previousPeople: [DetectedPerson] = []
+    private var previousPeople: [YTDetectedPerson] = []
     private var emaBox: CGRect?
 
     init() {
@@ -29,17 +29,17 @@ class FocusTrackingEngine {
     }
 
     func process(buffer: CVPixelBuffer,
-                 completion: @escaping (FocusResult) -> Void) {
+                 completion: @escaping (YTFocusResult) -> Void) {
         detect(buffer: buffer) { people in
             let withIDs = self.assignPersistentIDs(to: people)
             let active = self.selectActiveSubject(from: withIDs)
 
-            completion(FocusResult(people: withIDs, active: active))
+            completion(YTFocusResult(people: withIDs, active: active))
         }
     }
 
     private func detect(buffer: CVPixelBuffer,
-                        completion: @escaping ([DetectedPerson]) -> Void) {
+                        completion: @escaping ([YTDetectedPerson]) -> Void) {
 
         guard let model = detectionModel else {
             detectHumanFallback(buffer: buffer, completion: completion)
@@ -59,7 +59,7 @@ class FocusTrackingEngine {
 
             let detected = candidates.map { obs in
                 let expanded = self.expandForFullBody(obs.boundingBox)
-                return DetectedPerson(id: -1,
+                return YTDetectedPerson(id: -1,
                                       observation: VNDetectedObjectObservation(boundingBox: expanded),
                                       confidence: Double(obs.confidence))
             }
@@ -79,12 +79,12 @@ class FocusTrackingEngine {
     }
 
     private func detectHumanFallback(buffer: CVPixelBuffer,
-                                     completion: @escaping ([DetectedPerson]) -> Void) {
+                                     completion: @escaping ([YTDetectedPerson]) -> Void) {
         let request = VNDetectHumanRectanglesRequest { request, _ in
             let humans = request.results as? [VNHumanObservation] ?? []
             let detected = humans.map {
                 let expanded = self.expandForFullBody($0.boundingBox)
-                return DetectedPerson(id: -1,
+                return YTDetectedPerson(id: -1,
                                       observation: VNDetectedObjectObservation(boundingBox: expanded),
                                       confidence: 0.55)
             }
@@ -100,19 +100,19 @@ class FocusTrackingEngine {
         }
     }
 
-    private func assignPersistentIDs(to people: [DetectedPerson]) -> [DetectedPerson] {
-        var assigned: [DetectedPerson] = []
+    private func assignPersistentIDs(to people: [YTDetectedPerson]) -> [YTDetectedPerson] {
+        var assigned: [YTDetectedPerson] = []
 
         for person in people {
             let bbox = person.observation.boundingBox
             if let matched = previousPeople.max(by: {
                 iou($0.observation.boundingBox, bbox) < iou($1.observation.boundingBox, bbox)
             }), iou(matched.observation.boundingBox, bbox) > 0.2 {
-                assigned.append(DetectedPerson(id: matched.id,
+                assigned.append(YTDetectedPerson(id: matched.id,
                                                observation: person.observation,
                                                confidence: person.confidence))
             } else {
-                assigned.append(DetectedPerson(id: nextID,
+                assigned.append(YTDetectedPerson(id: nextID,
                                                observation: person.observation,
                                                confidence: person.confidence))
                 nextID += 1
@@ -123,7 +123,7 @@ class FocusTrackingEngine {
         return assigned
     }
 
-    private func selectActiveSubject(from people: [DetectedPerson]) -> DetectedPerson? {
+    private func selectActiveSubject(from people: [YTDetectedPerson]) -> YTDetectedPerson? {
         guard !people.isEmpty else {
             activeTrackID = nil
             focusLockUntil = nil
@@ -153,7 +153,7 @@ class FocusTrackingEngine {
         return scored.map(smoothed(person:))
     }
 
-    private func smoothed(person: DetectedPerson) -> DetectedPerson {
+    private func smoothed(person: YTDetectedPerson) -> YTDetectedPerson {
         let current = person.observation.boundingBox
         let alpha: CGFloat = 0.25
 
@@ -170,7 +170,7 @@ class FocusTrackingEngine {
         }
 
         emaBox = smoothedBox
-        return DetectedPerson(id: person.id,
+        return YTDetectedPerson(id: person.id,
                               observation: VNDetectedObjectObservation(boundingBox: smoothedBox),
                               confidence: person.confidence)
     }

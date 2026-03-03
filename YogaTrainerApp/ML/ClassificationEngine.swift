@@ -2,7 +2,7 @@ import Vision
 import CoreML
 import Foundation
 
-class ClassificationEngine {
+class YTPoseClassificationEngine {
 
     private var model: VNCoreMLModel?
     private var classLabels: [String] = []

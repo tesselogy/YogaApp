@@ -7,10 +7,10 @@ struct ContentView: View {
     @StateObject var camera = YogaCameraManager()
     @StateObject var poseState = PoseState()
 
-    let focusEngine = FocusTrackingEngine()
-    let classifier = ClassificationEngine()
+    let focusEngine = YTFocusTrackingEngine()
+    let classifier = YTPoseClassificationEngine()
 
-    @State var trackedPerson: DetectedPerson?
+    @State var trackedPerson: YTDetectedPerson?
     @State var classificationROI: CGRect?
     @State var detectionStatus: String = "Waiting for person..."
     @State var isProcessingFrame: Bool = false
