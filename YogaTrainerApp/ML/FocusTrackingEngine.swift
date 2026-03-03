@@ -2,29 +2,44 @@ import Vision
 import CoreML
 import Foundation
 
+struct DetectedPerson {
+    let id: Int
+    let observation: VNDetectedObjectObservation
+    let confidence: Double
+}
+
+struct FocusResult {
+    let people: [DetectedPerson]
+    let active: DetectedPerson?
+}
+
 class FocusTrackingEngine {
 
     private var detectionModel: VNCoreMLModel?
     private var lastLogTime: Date = .distantPast
 
+    private var activeTrackID: Int?
+    private var focusLockUntil: Date?
+    private var nextID: Int = 1
+    private var previousPeople: [DetectedPerson] = []
+    private var emaBox: CGRect?
+
     init() {
         detectionModel = Self.loadModel(named: "yolov8n")
-
-        if detectionModel == nil {
-            debugLog("YOLO model missing: yolov8n.mlmodelc was not found in app bundle")
-        } else {
-            debugLog("YOLO model loaded successfully")
-        }
     }
 
     func process(buffer: CVPixelBuffer,
-                 completion: @escaping (VNDetectedObjectObservation?) -> Void) {
-        // Always redetect on every frame to avoid tracker box shrinking/drifting to chest.
-        detect(buffer: buffer, completion: completion)
+                 completion: @escaping (FocusResult) -> Void) {
+        detect(buffer: buffer) { people in
+            let withIDs = self.assignPersistentIDs(to: people)
+            let active = self.selectActiveSubject(from: withIDs)
+
+            completion(FocusResult(people: withIDs, active: active))
+        }
     }
 
     private func detect(buffer: CVPixelBuffer,
-                        completion: @escaping (VNDetectedObjectObservation?) -> Void) {
+                        completion: @escaping ([DetectedPerson]) -> Void) {
 
         guard let model = detectionModel else {
             detectHumanFallback(buffer: buffer, completion: completion)
@@ -35,31 +50,21 @@ class FocusTrackingEngine {
             let results = request.results as? [VNRecognizedObjectObservation] ?? []
 
             if results.isEmpty {
-                self.debugLog("Detection returned 0 objects, trying Vision human fallback")
                 self.detectHumanFallback(buffer: buffer, completion: completion)
                 return
             }
 
-            let persons = results.filter {
-                $0.labels.first?.identifier.lowercased() == "person"
-            }
-
+            let persons = results.filter { $0.labels.first?.identifier.lowercased() == "person" }
             let candidates = persons.isEmpty ? results : persons
 
-            guard let best = candidates.max(by: {
-                ($0.boundingBox.width * $0.boundingBox.height) <
-                ($1.boundingBox.width * $1.boundingBox.height)
-            }) else {
-                self.detectHumanFallback(buffer: buffer, completion: completion)
-                return
+            let detected = candidates.map { obs in
+                let expanded = self.expandForFullBody(obs.boundingBox)
+                return DetectedPerson(id: -1,
+                                      observation: VNDetectedObjectObservation(boundingBox: expanded),
+                                      confidence: Double(obs.confidence))
             }
 
-            if persons.isEmpty {
-                self.debugLog("No explicit 'person' label, using largest detected object")
-            }
-
-            let expanded = self.expandForFullBody(best.boundingBox)
-            completion(VNDetectedObjectObservation(boundingBox: expanded))
+            completion(detected)
         }
 
         request.imageCropAndScaleOption = .scaleFill
@@ -68,37 +73,124 @@ class FocusTrackingEngine {
         do {
             try handler.perform([request])
         } catch {
-            debugLog("Detection request failed: \(error.localizedDescription), trying Vision human fallback")
+            debugLog("Detection request failed: \(error.localizedDescription)")
             detectHumanFallback(buffer: buffer, completion: completion)
         }
     }
 
     private func detectHumanFallback(buffer: CVPixelBuffer,
-                                     completion: @escaping (VNDetectedObjectObservation?) -> Void) {
+                                     completion: @escaping ([DetectedPerson]) -> Void) {
         let request = VNDetectHumanRectanglesRequest { request, _ in
             let humans = request.results as? [VNHumanObservation] ?? []
-
-            guard let best = humans.max(by: {
-                ($0.boundingBox.width * $0.boundingBox.height) <
-                ($1.boundingBox.width * $1.boundingBox.height)
-            }) else {
-                self.debugLog("Vision human fallback also found no person")
-                completion(nil)
-                return
+            let detected = humans.map {
+                let expanded = self.expandForFullBody($0.boundingBox)
+                return DetectedPerson(id: -1,
+                                      observation: VNDetectedObjectObservation(boundingBox: expanded),
+                                      confidence: 0.55)
             }
-
-            self.debugLog("Vision human fallback detected person")
-            let expanded = self.expandForFullBody(best.boundingBox)
-            completion(VNDetectedObjectObservation(boundingBox: expanded))
+            completion(detected)
         }
 
         let handler = VNImageRequestHandler(cvPixelBuffer: buffer)
         do {
             try handler.perform([request])
         } catch {
-            debugLog("Vision human fallback failed: \(error.localizedDescription)")
-            completion(nil)
+            debugLog("Vision fallback failed: \(error.localizedDescription)")
+            completion([])
         }
+    }
+
+    private func assignPersistentIDs(to people: [DetectedPerson]) -> [DetectedPerson] {
+        var assigned: [DetectedPerson] = []
+
+        for person in people {
+            let bbox = person.observation.boundingBox
+            if let matched = previousPeople.max(by: {
+                iou($0.observation.boundingBox, bbox) < iou($1.observation.boundingBox, bbox)
+            }), iou(matched.observation.boundingBox, bbox) > 0.2 {
+                assigned.append(DetectedPerson(id: matched.id,
+                                               observation: person.observation,
+                                               confidence: person.confidence))
+            } else {
+                assigned.append(DetectedPerson(id: nextID,
+                                               observation: person.observation,
+                                               confidence: person.confidence))
+                nextID += 1
+            }
+        }
+
+        previousPeople = assigned
+        return assigned
+    }
+
+    private func selectActiveSubject(from people: [DetectedPerson]) -> DetectedPerson? {
+        guard !people.isEmpty else {
+            activeTrackID = nil
+            focusLockUntil = nil
+            emaBox = nil
+            return nil
+        }
+
+        let now = Date()
+
+        if let currentID = activeTrackID,
+           let locked = people.first(where: { $0.id == currentID }),
+           let lockUntil = focusLockUntil,
+           now < lockUntil {
+            return smoothed(person: locked)
+        }
+
+        let scored = people.max { lhs, rhs in
+            subjectScore(lhs.observation.boundingBox) < subjectScore(rhs.observation.boundingBox)
+        }
+
+        if let scored, scored.id != activeTrackID {
+            activeTrackID = scored.id
+            focusLockUntil = now.addingTimeInterval(2.0)
+            emaBox = scored.observation.boundingBox
+        }
+
+        return scored.map(smoothed(person:))
+    }
+
+    private func smoothed(person: DetectedPerson) -> DetectedPerson {
+        let current = person.observation.boundingBox
+        let alpha: CGFloat = 0.25
+
+        let smoothedBox: CGRect
+        if let previous = emaBox {
+            smoothedBox = CGRect(
+                x: previous.origin.x * (1 - alpha) + current.origin.x * alpha,
+                y: previous.origin.y * (1 - alpha) + current.origin.y * alpha,
+                width: previous.size.width * (1 - alpha) + current.size.width * alpha,
+                height: previous.size.height * (1 - alpha) + current.size.height * alpha
+            )
+        } else {
+            smoothedBox = current
+        }
+
+        emaBox = smoothedBox
+        return DetectedPerson(id: person.id,
+                              observation: VNDetectedObjectObservation(boundingBox: smoothedBox),
+                              confidence: person.confidence)
+    }
+
+    private func subjectScore(_ bbox: CGRect) -> CGFloat {
+        let center = CGPoint(x: bbox.midX, y: bbox.midY)
+        let dx = center.x - 0.5
+        let dy = center.y - 0.5
+        let distance = sqrt(dx * dx + dy * dy)
+        let centerScore = max(0, 1 - distance / 0.8)
+        let areaScore = bbox.width * bbox.height
+        return centerScore * 0.6 + areaScore * 0.4
+    }
+
+    private func iou(_ a: CGRect, _ b: CGRect) -> CGFloat {
+        let inter = a.intersection(b)
+        guard !inter.isNull else { return 0 }
+        let interArea = inter.width * inter.height
+        let unionArea = a.width * a.height + b.width * b.height - interArea
+        return unionArea > 0 ? interArea / unionArea : 0
     }
 
     private func expandForFullBody(_ bbox: CGRect) -> CGRect {
@@ -108,7 +200,6 @@ class FocusTrackingEngine {
         let expandedWidth = min(1, bbox.width * widthScale)
         let expandedHeight = min(1, bbox.height * heightScale)
 
-        // Shift center slightly down to include legs when detector is torso-biased.
         let centerX = bbox.midX
         let centerY = bbox.midY - bbox.height * 0.15
 

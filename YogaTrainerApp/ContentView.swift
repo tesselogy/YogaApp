@@ -10,13 +10,15 @@ struct ContentView: View {
     let focusEngine = FocusTrackingEngine()
     let classifier = ClassificationEngine()
 
-    @State var trackedObservation: VNDetectedObjectObservation?
+    @State var trackedPerson: DetectedPerson?
     @State var classificationROI: CGRect?
     @State var detectionStatus: String = "Waiting for person..."
     @State var isProcessingFrame: Bool = false
 
+    private let classificationIntervalFrames = 3
+
     private func expandedROI(from bbox: CGRect) -> CGRect {
-        let scale: CGFloat = 1.8
+        let scale: CGFloat = 1.1
         let newWidth = min(1, bbox.width * scale)
         let newHeight = min(1, bbox.height * scale)
         let newX = max(0, min(1 - newWidth, bbox.midX - newWidth / 2))
@@ -37,27 +39,36 @@ struct ContentView: View {
                             guard !isProcessingFrame else { return }
                             isProcessingFrame = true
 
-                            focusEngine.process(buffer: buffer) { obs in
-                                guard let obs else {
+                            focusEngine.process(buffer: buffer) { result in
+                                guard let active = result.active else {
                                     DispatchQueue.main.async {
-                                        trackedObservation = nil
+                                        trackedPerson = nil
                                         classificationROI = nil
-                                        detectionStatus = "Person not detected"
-                                        poseState.update(newPose: "no_person")
+                                        detectionStatus = "No subject"
+                                        poseState.resetForNoPerson()
                                         isProcessingFrame = false
                                     }
                                     return
                                 }
 
-                                let roi = expandedROI(from: obs.boundingBox)
+                                let roi = expandedROI(from: active.observation.boundingBox)
+
+                                if !poseState.shouldClassifyThisFrame(every: classificationIntervalFrames) {
+                                    DispatchQueue.main.async {
+                                        trackedPerson = active
+                                        classificationROI = roi
+                                        detectionStatus = "Focus ID: \(active.id)"
+                                        isProcessingFrame = false
+                                    }
+                                    return
+                                }
 
                                 classifier.classify(buffer: buffer, regionOfInterest: roi) { label, confidence in
                                     DispatchQueue.main.async {
-                                        trackedObservation = obs
+                                        trackedPerson = active
                                         classificationROI = roi
-                                        detectionStatus = "Person detected"
-                                        poseState.update(newPose: label)
-                                        print("[ContentView] pose=\(label) confidence=\(String(format: "%.2f", confidence)) detection=\(detectionStatus)")
+                                        detectionStatus = "Focus ID: \(active.id)"
+                                        poseState.updateFromClassifier(label: label, confidence: confidence)
                                         isProcessingFrame = false
                                     }
                                 }
@@ -65,16 +76,16 @@ struct ContentView: View {
                         }
                 }
 
-                if let trackedObservation {
-                    DetectionBox(observation: trackedObservation)
-                        .stroke(.green, lineWidth: 4)
+                if let trackedPerson {
+                    DetectionBox(observation: trackedPerson.observation)
+                        .stroke(boxColor(confidence: trackedPerson.confidence), lineWidth: boxWidth(confidence: trackedPerson.confidence))
                         .frame(
-                            width: trackedObservation.boundingBox.width * geo.size.width,
-                            height: trackedObservation.boundingBox.height * geo.size.height
+                            width: trackedPerson.observation.boundingBox.width * geo.size.width,
+                            height: trackedPerson.observation.boundingBox.height * geo.size.height
                         )
                         .position(
-                            x: trackedObservation.boundingBox.midX * geo.size.width,
-                            y: (1 - trackedObservation.boundingBox.midY) * geo.size.height
+                            x: trackedPerson.observation.boundingBox.midX * geo.size.width,
+                            y: (1 - trackedPerson.observation.boundingBox.midY) * geo.size.height
                         )
                 }
 
@@ -92,59 +103,62 @@ struct ContentView: View {
                 }
 
                 VStack {
-                    HStack {
-                        Spacer()
-
-                        if classificationROI != nil {
-                            Text("Yellow dashed box = ROI for classify")
-                                .font(.caption)
-                                .padding(.horizontal, 10)
-                                .padding(.vertical, 6)
-                                .background(.black.opacity(0.45))
-                                .foregroundColor(.yellow)
-                                .cornerRadius(10)
-                                .padding(.top, 30)
-                                .padding(.trailing, 20)
-                        }
-                    }
-
                     Spacer()
 
                     Text(poseState.pose.uppercased())
-                        .font(.system(size: 80, weight: .bold))
-                        .foregroundStyle(
-                            LinearGradient(
-                                colors: [.purple, .cyan, .mint],
-                                startPoint: .leading,
-                                endPoint: .trailing
-                            )
-                        )
-                        .shadow(radius: 15)
+                        .font(.system(size: 72, weight: .bold))
+                        .minimumScaleFactor(0.5)
+                        .foregroundColor(.white)
+                        .shadow(color: .black.opacity(0.7), radius: 4)
 
-                    Text("Hold: \(poseState.holdTime, specifier: "%.1f")s")
-                        .font(.title3)
-                        .foregroundColor(.white.opacity(0.8))
+                    if poseState.pose != "UNCERTAIN" && poseState.pose != "NO_PERSON" {
+                        Text("HOLD: \(poseState.holdTime, specifier: "%.1f")s")
+                            .font(.headline)
+                            .foregroundColor(.white)
+
+                        PoseProgressRing(progress: poseState.progress)
+                            .frame(width: 90, height: 90)
+                            .padding(.top, 6)
+                    }
+
+                    if let completion = poseState.completionWord {
+                        Text(completion)
+                            .font(.system(size: 40, weight: .heavy))
+                            .foregroundColor(Color(red: 0.6, green: 0.96, blue: 0.8))
+                            .scaleEffect(1.08)
+                    }
 
                     Text(detectionStatus)
-                        .font(.headline)
-                        .padding(.horizontal, 16)
-                        .padding(.vertical, 8)
-                        .background(.black.opacity(0.45))
+                        .font(.caption)
                         .foregroundColor(.white)
-                        .cornerRadius(12)
+                        .padding(.top, 8)
 
                     Spacer()
 
-                    Text("Press Q to quit")
+                    Text("Press Q / Й to quit")
                         .font(.caption)
-                        .padding(12)
-                        .background(.ultraThinMaterial)
-                        .cornerRadius(18)
-                        .padding(.bottom, 40)
+                        .foregroundColor(.white)
+                        .padding(10)
+                        .background(Color.black.opacity(0.45))
+                        .cornerRadius(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(.leading, 18)
+                        .padding(.bottom, 24)
                 }
             }
             .ignoresSafeArea()
+            .background(.black)
         }
+    }
+
+    private func boxColor(confidence: Double) -> Color {
+        if confidence < 0.45 { return Color(red: 0.7, green: 0.45, blue: 0.9) }
+        if confidence < 0.7 { return Color(red: 0.95, green: 0.66, blue: 0.45) }
+        return Color(red: 0.55, green: 0.93, blue: 0.75)
+    }
+
+    private func boxWidth(confidence: Double) -> CGFloat {
+        CGFloat(2.0 + min(max(confidence, 0), 1) * 5.0)
     }
 }
 
