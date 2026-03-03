@@ -4,7 +4,7 @@ import Foundation
 
 struct ContentView: View {
 
-    @StateObject var camera = CameraManager()
+    @StateObject var camera = YogaCameraManager()
     @StateObject var poseState = PoseState()
 
     let focusEngine = FocusTrackingEngine()

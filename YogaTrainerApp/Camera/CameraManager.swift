@@ -1,7 +1,7 @@
 import AVFoundation
 import Combine
 
-class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
+class YogaCameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleBufferDelegate {
 
     @Published var currentBuffer: CVPixelBuffer?
 
