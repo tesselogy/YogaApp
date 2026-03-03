@@ -34,6 +34,7 @@ final class YOLODetector {
     private let personClassIndex: Int
     private let inputConstraint: MLImageConstraint?
     private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
+    private let coordsPrimaryFormula: String = "xywh"
 
     init?(modelName: String = "yolov8n",
           confidenceThreshold: Float = 0.25,
@@ -276,17 +277,24 @@ final class YOLODetector {
             let y2xywh = cy + h / 2
             let mappedXYWH = mapModelBoxToFrame(x1xywh, y1xywh, x2xywh, y2xywh, prep: prep)
 
-            let dump = "r\(r):raw=[\(String(format: "%.2f", a)),\(String(format: "%.2f", b)),\(String(format: "%.2f", c)),\(String(format: "%.2f", d))] norm=\(normalized ? 1 : 0) top=\(bestClass):\(String(format: "%.3f", bestScore)) xyxy=\(mappedXYXY?.debugDescription ?? "nil") xywh=\(mappedXYWH?.debugDescription ?? "nil")"
+            let chosen: CGRect?
+            if coordsPrimaryFormula == "xywh" {
+                chosen = mappedXYWH ?? mappedXYXY
+            } else {
+                chosen = mappedXYXY ?? mappedXYWH
+            }
+
+            let dump = "r\(r):raw=[\(String(format: "%.2f", a)),\(String(format: "%.2f", b)),\(String(format: "%.2f", c)),\(String(format: "%.2f", d))] norm=\(normalized ? 1 : 0) top=\(bestClass):\(String(format: "%.3f", bestScore)) xyxy=\(mappedXYXY?.debugDescription ?? "nil") xywh=\(mappedXYWH?.debugDescription ?? "nil") chosen=\(chosen?.debugDescription ?? "nil") formula=\(coordsPrimaryFormula)"
             dumps.append(dump)
 
             guard bestScore >= confidenceThreshold else { continue }
-            if let box = mappedXYXY {
+            if let box = chosen {
                 detections.append(Detection(bbox: box, confidence: bestScore, classIndex: bestClass))
             }
         }
 
         let space = "space(camera=\(prep.frameWidth)x\(prep.frameHeight),model=\(prep.modelWidth)x\(prep.modelHeight),scale=\(String(format: "%.4f", prep.scale)),pad=[\(String(format: "%.1f", prep.padX)),\(String(format: "%.1f", prep.padY))])"
-        lastCoordsDump = "coords_formula_probe \(space) rows=\(rows) \(dumps.joined(separator: " | "))"
+        lastCoordsDump = "coords_formula_probe formula=\(coordsPrimaryFormula) \(space) rows=\(rows) \(dumps.joined(separator: " | "))"
 
         return detections
     }
