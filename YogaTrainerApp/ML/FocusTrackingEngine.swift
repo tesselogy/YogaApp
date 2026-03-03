@@ -58,7 +58,8 @@ class FocusTrackingEngine {
                 self.debugLog("No explicit 'person' label, using largest detected object")
             }
 
-            completion(best)
+            let expanded = self.expandForFullBody(best.boundingBox)
+            completion(VNDetectedObjectObservation(boundingBox: expanded))
         }
 
         request.imageCropAndScaleOption = .scaleFill
@@ -87,7 +88,8 @@ class FocusTrackingEngine {
             }
 
             self.debugLog("Vision human fallback detected person")
-            completion(VNDetectedObjectObservation(boundingBox: best.boundingBox))
+            let expanded = self.expandForFullBody(best.boundingBox)
+            completion(VNDetectedObjectObservation(boundingBox: expanded))
         }
 
         let handler = VNImageRequestHandler(cvPixelBuffer: buffer)
@@ -97,6 +99,23 @@ class FocusTrackingEngine {
             debugLog("Vision human fallback failed: \(error.localizedDescription)")
             completion(nil)
         }
+    }
+
+    private func expandForFullBody(_ bbox: CGRect) -> CGRect {
+        let widthScale: CGFloat = 1.35
+        let heightScale: CGFloat = 2.0
+
+        let expandedWidth = min(1, bbox.width * widthScale)
+        let expandedHeight = min(1, bbox.height * heightScale)
+
+        // Shift center slightly down to include legs when detector is torso-biased.
+        let centerX = bbox.midX
+        let centerY = bbox.midY - bbox.height * 0.15
+
+        let x = max(0, min(1 - expandedWidth, centerX - expandedWidth / 2))
+        let y = max(0, min(1 - expandedHeight, centerY - expandedHeight / 2))
+
+        return CGRect(x: x, y: y, width: expandedWidth, height: expandedHeight)
     }
 
     private static func loadModel(named name: String) -> VNCoreMLModel? {
