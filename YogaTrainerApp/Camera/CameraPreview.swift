@@ -1,31 +1,41 @@
 import SwiftUI
-import CoreImage
+import AVFoundation
 
-struct CameraPreview: View {
+struct CameraPreview: NSViewRepresentable {
 
-    var pixelBuffer: CVPixelBuffer?
+    let session: AVCaptureSession
 
-    private let context = CIContext(options: [.useSoftwareRenderer: false])
-
-    var body: some View {
-
-        GeometryReader { geo in
-            if let buffer = pixelBuffer,
-               let cgImage = convertToCGImage(buffer: buffer) {
-
-                Image(decorative: cgImage, scale: 1.0)
-                    .resizable()
-                    .scaledToFill()
-                    .frame(width: geo.size.width, height: geo.size.height)
-                    .clipped()
-            } else {
-                Color.black
-            }
-        }
+    func makeNSView(context: Context) -> CameraPreviewView {
+        let view = CameraPreviewView()
+        view.previewLayer.session = session
+        view.previewLayer.videoGravity = .resizeAspectFill
+        return view
     }
 
-    private func convertToCGImage(buffer: CVPixelBuffer) -> CGImage? {
-        let ciImage = CIImage(cvPixelBuffer: buffer)
-        return context.createCGImage(ciImage, from: ciImage.extent)
+    func updateNSView(_ nsView: CameraPreviewView, context: Context) {
+        if nsView.previewLayer.session !== session {
+            nsView.previewLayer.session = session
+        }
+    }
+}
+
+final class CameraPreviewView: NSView {
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        wantsLayer = true
+        layer = AVCaptureVideoPreviewLayer()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    var previewLayer: AVCaptureVideoPreviewLayer {
+        guard let layer = layer as? AVCaptureVideoPreviewLayer else {
+            let fallback = AVCaptureVideoPreviewLayer()
+            self.layer = fallback
+            return fallback
+        }
+        return layer
     }
 }

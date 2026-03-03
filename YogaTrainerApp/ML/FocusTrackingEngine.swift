@@ -13,104 +13,112 @@ class FocusTrackingEngine {
         if detectionModel == nil {
             debugLog("YOLO model missing: yolov8n.mlmodelc was not found in app bundle")
         } else {
-            debugLog("YOLO model loaded successfully")
+            debugLog("YOLO model loaded successfully (used only as fallback)")
         }
     }
 
     func process(buffer: CVPixelBuffer,
                  completion: @escaping (VNDetectedObjectObservation?) -> Void) {
-        // Always redetect on every frame to avoid tracker box shrinking/drifting to chest.
-        detect(buffer: buffer, completion: completion)
+        detectHuman(buffer: buffer) { humanObservation in
+            if let humanObservation {
+                completion(humanObservation)
+                return
+            }
+
+            self.debugLog("Human rectangles found no person, trying YOLO fallback")
+            self.detectWithYOLOFallback(buffer: buffer, completion: completion)
+        }
     }
 
-    private func detect(buffer: CVPixelBuffer,
-                        completion: @escaping (VNDetectedObjectObservation?) -> Void) {
+    private func detectHuman(buffer: CVPixelBuffer,
+                             completion: @escaping (VNDetectedObjectObservation?) -> Void) {
+        let request = VNDetectHumanRectanglesRequest { request, _ in
+            let humans = request.results as? [VNHumanObservation] ?? []
 
+            guard let best = self.bestSubject(from: humans.map { $0.boundingBox }) else {
+                completion(nil)
+                return
+            }
+
+            let expanded = self.expandForFullBody(best)
+            completion(VNDetectedObjectObservation(boundingBox: expanded))
+        }
+
+        let handler = VNImageRequestHandler(cvPixelBuffer: buffer)
+        do {
+            try handler.perform([request])
+        } catch {
+            debugLog("Human rectangles failed: \(error.localizedDescription)")
+            completion(nil)
+        }
+    }
+
+    private func detectWithYOLOFallback(buffer: CVPixelBuffer,
+                                        completion: @escaping (VNDetectedObjectObservation?) -> Void) {
         guard let model = detectionModel else {
-            detectHumanFallback(buffer: buffer, completion: completion)
+            completion(nil)
             return
         }
 
         let request = VNCoreMLRequest(model: model) { request, _ in
             let results = request.results as? [VNRecognizedObjectObservation] ?? []
 
-            if results.isEmpty {
-                self.debugLog("Detection returned 0 objects, trying Vision human fallback")
-                self.detectHumanFallback(buffer: buffer, completion: completion)
-                return
-            }
-
-            let persons = results.filter {
-                $0.labels.first?.identifier.lowercased() == "person"
-            }
-
-            let candidates = persons.isEmpty ? results : persons
-
-            guard let best = candidates.max(by: {
-                ($0.boundingBox.width * $0.boundingBox.height) <
-                ($1.boundingBox.width * $1.boundingBox.height)
-            }) else {
-                self.detectHumanFallback(buffer: buffer, completion: completion)
-                return
-            }
-
-            if persons.isEmpty {
-                self.debugLog("No explicit 'person' label, using largest detected object")
-            }
-
-            let expanded = self.expandForFullBody(best.boundingBox)
-            completion(VNDetectedObjectObservation(boundingBox: expanded))
-        }
-
-        request.imageCropAndScaleOption = .scaleFill
-
-        let handler = VNImageRequestHandler(cvPixelBuffer: buffer)
-        do {
-            try handler.perform([request])
-        } catch {
-            debugLog("Detection request failed: \(error.localizedDescription), trying Vision human fallback")
-            detectHumanFallback(buffer: buffer, completion: completion)
-        }
-    }
-
-    private func detectHumanFallback(buffer: CVPixelBuffer,
-                                     completion: @escaping (VNDetectedObjectObservation?) -> Void) {
-        let request = VNDetectHumanRectanglesRequest { request, _ in
-            let humans = request.results as? [VNHumanObservation] ?? []
-
-            guard let best = humans.max(by: {
-                ($0.boundingBox.width * $0.boundingBox.height) <
-                ($1.boundingBox.width * $1.boundingBox.height)
-            }) else {
-                self.debugLog("Vision human fallback also found no person")
+            guard !results.isEmpty else {
+                self.debugLog("YOLO fallback found no objects")
                 completion(nil)
                 return
             }
 
-            self.debugLog("Vision human fallback detected person")
-            let expanded = self.expandForFullBody(best.boundingBox)
+            let persons = results
+                .filter { $0.labels.first?.identifier.lowercased() == "person" }
+                .map(\.boundingBox)
+
+            let candidates = persons.isEmpty ? results.map(\.boundingBox) : persons
+
+            guard let best = self.bestSubject(from: candidates) else {
+                completion(nil)
+                return
+            }
+
+            let expanded = self.expandForFullBody(best)
             completion(VNDetectedObjectObservation(boundingBox: expanded))
         }
+
+        request.imageCropAndScaleOption = .scaleFit
 
         let handler = VNImageRequestHandler(cvPixelBuffer: buffer)
         do {
             try handler.perform([request])
         } catch {
-            debugLog("Vision human fallback failed: \(error.localizedDescription)")
+            debugLog("YOLO fallback failed: \(error.localizedDescription)")
             completion(nil)
         }
     }
 
+    private func bestSubject(from boxes: [CGRect]) -> CGRect? {
+        guard !boxes.isEmpty else { return nil }
+
+        return boxes.max(by: { score(for: $0) < score(for: $1) })
+    }
+
+    private func score(for box: CGRect) -> CGFloat {
+        let centerDistance = hypot(box.midX - 0.5, box.midY - 0.5)
+        let maxDistance = hypot(CGFloat(0.5), CGFloat(0.5))
+        let centerScore = max(0, 1 - centerDistance / maxDistance)
+        let areaScore = min(1, box.width * box.height)
+
+        return centerScore * 0.6 + areaScore * 0.4
+    }
+
     private func expandForFullBody(_ bbox: CGRect) -> CGRect {
-        let widthScale: CGFloat = 1.35
-        let heightScale: CGFloat = 2.0
+        let widthScale: CGFloat = 1.5
+        let heightScale: CGFloat = 2.4
 
         let expandedWidth = min(1, bbox.width * widthScale)
         let expandedHeight = min(1, bbox.height * heightScale)
 
-        // Shift center slightly down to include legs when detector is torso-biased.
         let centerX = bbox.midX
-        let centerY = bbox.midY - bbox.height * 0.15
+        let centerY = bbox.midY - bbox.height * 0.2
 
         let x = max(0, min(1 - expandedWidth, centerX - expandedWidth / 2))
         let y = max(0, min(1 - expandedHeight, centerY - expandedHeight / 2))
