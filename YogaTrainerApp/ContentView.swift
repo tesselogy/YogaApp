@@ -34,7 +34,7 @@ struct ContentView: View {
                                 let output = frameProcessor.process(frame: buffer)
                                 DispatchQueue.main.async {
                                     if let track = output.selectedTrack {
-                                        trackedBBox = track.smoothedBBox
+                                        trackedBBox = output.selectedBBox ?? track.smoothedBBox
                                         detectionStatus = "Person detected (id: \(track.id))"
                                         poseState.update(newPose: output.label)
                                         debugLine = output.debugInfo
