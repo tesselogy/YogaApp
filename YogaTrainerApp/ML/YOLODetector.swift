@@ -1,6 +1,7 @@
 import CoreML
 import Foundation
 import CoreVideo
+import CoreImage
 
 struct Detection {
     let bbox: CGRect // pixel xyxy stored as CGRect(x:x1,y:y1,width:x2-x1,height:y2-y1)
@@ -17,6 +18,8 @@ final class YOLODetector {
     private let confidenceThreshold: Float
     private let iouThreshold: Float
     private let personClassIndex: Int
+    private let inputConstraint: MLImageConstraint?
+    private let ciContext = CIContext(options: [.useSoftwareRenderer: false])
 
     init?(modelName: String = "yolov8n",
           confidenceThreshold: Float = 0.25,
@@ -37,30 +40,40 @@ final class YOLODetector {
         self.confidenceThreshold = confidenceThreshold
         self.iouThreshold = iouThreshold
         self.personClassIndex = personClassIndex
+        self.inputConstraint = loadedModel.modelDescription.inputDescriptionsByName[imageInput]?.imageConstraint
     }
 
     func detectPersons(in frame: CVPixelBuffer) -> [Detection] {
-        guard let provider = try? MLDictionaryFeatureProvider(dictionary: [inputName: MLFeatureValue(pixelBuffer: frame)]),
-              let prediction = try? model.prediction(from: provider) else {
-            lastDebugMessage = "prediction_failed"
+        let actualFormat = CVPixelBufferGetPixelFormatType(frame)
+        guard let inputBuffer = makeInputBufferIfNeeded(from: frame) else {
+            lastDebugMessage = "input_convert_failed expected=\(pixelFormatName(inputConstraint?.pixelFormatType ?? 0)) actual=\(pixelFormatName(actualFormat))"
             return []
         }
 
-        let frameWidth = CVPixelBufferGetWidth(frame)
-        let frameHeight = CVPixelBufferGetHeight(frame)
-        let all = decodeYOLOOutput(prediction: prediction, frameWidth: frameWidth, frameHeight: frameHeight)
-        let persons = all.filter { $0.classIndex == personClassIndex }
-        let nms = nonMaximumSuppression(persons, iouThreshold: iouThreshold)
+        do {
+            let provider = try MLDictionaryFeatureProvider(dictionary: [inputName: MLFeatureValue(pixelBuffer: inputBuffer)])
+            let prediction = try model.prediction(from: provider)
 
-        let shapeInfo = outputNames
-            .compactMap { name -> String? in
-                guard let m = prediction.featureValue(for: name)?.multiArrayValue else { return nil }
-                return "\(name):\(m.shape.map{$0.intValue})"
-            }
-            .joined(separator: ",")
+            let frameWidth = CVPixelBufferGetWidth(frame)
+            let frameHeight = CVPixelBufferGetHeight(frame)
+            let all = decodeYOLOOutput(prediction: prediction, frameWidth: frameWidth, frameHeight: frameHeight)
+            let persons = all.filter { $0.classIndex == personClassIndex }
+            let nms = nonMaximumSuppression(persons, iouThreshold: iouThreshold)
 
-        lastDebugMessage = "outputs=[\(shapeInfo)] all=\(all.count) person=\(persons.count) nms=\(nms.count)"
-        return nms
+            let shapeInfo = outputNames
+                .compactMap { name -> String? in
+                    guard let m = prediction.featureValue(for: name)?.multiArrayValue else { return nil }
+                    return "\(name):\(m.shape.map{$0.intValue})"
+                }
+                .joined(separator: ",")
+
+            lastDebugMessage = "fmt=\(pixelFormatName(actualFormat))->\(pixelFormatName(CVPixelBufferGetPixelFormatType(inputBuffer))) outputs=[\(shapeInfo)] all=\(all.count) person=\(persons.count) nms=\(nms.count)"
+            return nms
+        } catch {
+            let expected = pixelFormatName(inputConstraint?.pixelFormatType ?? 0)
+            lastDebugMessage = "prediction_failed expected=\(expected) actual=\(pixelFormatName(actualFormat)) err=\(error.localizedDescription)"
+            return []
+        }
     }
 
     func debugMessage() -> String {
@@ -157,6 +170,51 @@ final class YOLODetector {
 
         lastDebugMessage = "unsupported_tensor_shape=\(shape)"
         return []
+    }
+
+    private func makeInputBufferIfNeeded(from frame: CVPixelBuffer) -> CVPixelBuffer? {
+        guard let inputConstraint else { return frame }
+
+        let expectedFormat = inputConstraint.pixelFormatType
+        let actualFormat = CVPixelBufferGetPixelFormatType(frame)
+
+        if expectedFormat == 0 || expectedFormat == actualFormat {
+            return frame
+        }
+
+        let width = CVPixelBufferGetWidth(frame)
+        let height = CVPixelBufferGetHeight(frame)
+
+        var converted: CVPixelBuffer?
+        let attrs: [CFString: Any] = [
+            kCVPixelBufferCGImageCompatibilityKey: true,
+            kCVPixelBufferCGBitmapContextCompatibilityKey: true
+        ]
+
+        guard CVPixelBufferCreate(kCFAllocatorDefault,
+                                  width,
+                                  height,
+                                  expectedFormat,
+                                  attrs as CFDictionary,
+                                  &converted) == kCVReturnSuccess,
+              let converted else {
+            return nil
+        }
+
+        let ciImage = CIImage(cvPixelBuffer: frame)
+        ciContext.render(ciImage, to: converted)
+        return converted
+    }
+
+    private func pixelFormatName(_ type: OSType) -> String {
+        switch type {
+        case kCVPixelFormatType_32BGRA: return "32BGRA"
+        case kCVPixelFormatType_OneComponent8: return "OneComponent8"
+        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange: return "420f"
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange: return "420v"
+        case 0: return "unspecified"
+        default: return "\(type)"
+        }
     }
 
     private func nonMaximumSuppression(_ detections: [Detection], iouThreshold: Float) -> [Detection] {
