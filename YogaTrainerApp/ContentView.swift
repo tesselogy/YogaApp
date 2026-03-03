@@ -15,13 +15,15 @@ struct ContentView: View {
     @State var detectionStatus: String = "Waiting for person..."
     @State var isProcessingFrame: Bool = false
     @State private var frameCounter: Int = 0
+    @State private var imageSize: CGSize = .zero
 
     private let processingQueue = DispatchQueue(label: "vision.processing.queue", qos: .userInitiated)
 
     private func expandedROI(from bbox: CGRect) -> CGRect {
-        let scale: CGFloat = 1.8
-        let newWidth = min(1, bbox.width * scale)
-        let newHeight = min(1, bbox.height * scale)
+        let widthScale: CGFloat = 2.0
+        let heightScale: CGFloat = 2.3
+        let newWidth = min(1, bbox.width * widthScale)
+        let newHeight = min(1, bbox.height * heightScale)
         let newX = max(0, min(1 - newWidth, bbox.midX - newWidth / 2))
         let newY = max(0, min(1 - newHeight, bbox.midY - newHeight / 2))
         return CGRect(x: newX, y: newY, width: newWidth, height: newHeight)
@@ -35,65 +37,58 @@ struct ContentView: View {
                 CameraPreview(session: camera.captureSession)
                     .scaledToFill()
                     .onChange(of: camera.currentBuffer) { _, newBuffer in
-                            guard let buffer = newBuffer else { return }
-                            guard !isProcessingFrame else { return }
+                        guard let buffer = newBuffer else { return }
+                        guard !isProcessingFrame else { return }
 
-                            isProcessingFrame = true
-                            frameCounter += 1
+                        imageSize = CGSize(width: CVPixelBufferGetWidth(buffer),
+                                           height: CVPixelBufferGetHeight(buffer))
 
-                            let cachedObservation = trackedObservation
-                            let shouldRedetect = cachedObservation == nil || frameCounter % 3 == 0
+                        isProcessingFrame = true
+                        frameCounter += 1
 
-                            processingQueue.async {
-                                if shouldRedetect {
-                                    focusEngine.process(buffer: buffer) { obs in
-                                        guard let obs else {
-                                            DispatchQueue.main.async {
-                                                trackedObservation = nil
-                                                classificationROI = nil
-                                                detectionStatus = "Person not detected"
-                                                poseState.update(newPose: "no_person")
-                                                isProcessingFrame = false
-                                            }
-                                            return
+                        let cachedObservation = trackedObservation
+                        let shouldRedetect = cachedObservation == nil || frameCounter % 3 == 0
+
+                        processingQueue.async {
+                            if shouldRedetect {
+                                focusEngine.process(buffer: buffer) { obs in
+                                    guard let obs else {
+                                        DispatchQueue.main.async {
+                                            trackedObservation = nil
+                                            classificationROI = nil
+                                            detectionStatus = "Person not detected"
+                                            poseState.update(newPose: "no_person")
+                                            isProcessingFrame = false
                                         }
+                                        return
+                                    }
 
-                                        classify(buffer: buffer, observation: obs)
-                                    }
-                                } else if let cachedObservation {
-                                    classify(buffer: buffer, observation: cachedObservation)
-                                } else {
-                                    DispatchQueue.main.async {
-                                        isProcessingFrame = false
-                                    }
+                                    classify(buffer: buffer, observation: obs)
+                                }
+                            } else if let cachedObservation {
+                                classify(buffer: buffer, observation: cachedObservation)
+                            } else {
+                                DispatchQueue.main.async {
+                                    isProcessingFrame = false
                                 }
                             }
                         }
+                    }
 
                 if let trackedObservation {
+                    let rect = toPreviewRect(normalizedBBox: trackedObservation.boundingBox, viewSize: geo.size)
                     DetectionBox(observation: trackedObservation)
                         .stroke(.green, lineWidth: 4)
-                        .frame(
-                            width: trackedObservation.boundingBox.width * geo.size.width,
-                            height: trackedObservation.boundingBox.height * geo.size.height
-                        )
-                        .position(
-                            x: trackedObservation.boundingBox.midX * geo.size.width,
-                            y: (1 - trackedObservation.boundingBox.midY) * geo.size.height
-                        )
+                        .frame(width: rect.width, height: rect.height)
+                        .position(x: rect.midX, y: rect.midY)
                 }
 
                 if let classificationROI {
+                    let rect = toPreviewRect(normalizedBBox: classificationROI, viewSize: geo.size)
                     DetectionBox(observation: VNDetectedObjectObservation(boundingBox: classificationROI))
                         .stroke(.yellow, style: StrokeStyle(lineWidth: 3, dash: [10, 8]))
-                        .frame(
-                            width: classificationROI.width * geo.size.width,
-                            height: classificationROI.height * geo.size.height
-                        )
-                        .position(
-                            x: classificationROI.midX * geo.size.width,
-                            y: (1 - classificationROI.midY) * geo.size.height
-                        )
+                        .frame(width: rect.width, height: rect.height)
+                        .position(x: rect.midX, y: rect.midY)
                 }
 
                 VStack {
@@ -165,6 +160,33 @@ struct ContentView: View {
                 isProcessingFrame = false
             }
         }
+    }
+
+    private func toPreviewRect(normalizedBBox: CGRect, viewSize: CGSize) -> CGRect {
+        guard imageSize.width > 0, imageSize.height > 0, viewSize.width > 0, viewSize.height > 0 else {
+            return CGRect(x: normalizedBBox.minX * viewSize.width,
+                          y: (1 - normalizedBBox.maxY) * viewSize.height,
+                          width: normalizedBBox.width * viewSize.width,
+                          height: normalizedBBox.height * viewSize.height)
+        }
+
+        let scale = max(viewSize.width / imageSize.width, viewSize.height / imageSize.height)
+        let scaledWidth = imageSize.width * scale
+        let scaledHeight = imageSize.height * scale
+        let xCrop = (scaledWidth - viewSize.width) / 2
+        let yCrop = (scaledHeight - viewSize.height) / 2
+
+        let imageRect = CGRect(x: normalizedBBox.minX * imageSize.width,
+                               y: normalizedBBox.minY * imageSize.height,
+                               width: normalizedBBox.width * imageSize.width,
+                               height: normalizedBBox.height * imageSize.height)
+
+        let topLeftY = imageSize.height - imageRect.maxY
+
+        return CGRect(x: imageRect.minX * scale - xCrop,
+                      y: topLeftY * scale - yCrop,
+                      width: imageRect.width * scale,
+                      height: imageRect.height * scale)
     }
 }
 

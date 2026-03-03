@@ -62,7 +62,7 @@ class FocusTrackingEngine {
             completion(VNDetectedObjectObservation(boundingBox: expanded))
         }
 
-        request.imageCropAndScaleOption = .scaleFill
+        request.imageCropAndScaleOption = .scaleFit
 
         let handler = VNImageRequestHandler(cvPixelBuffer: buffer)
         do {
@@ -102,15 +102,15 @@ class FocusTrackingEngine {
     }
 
     private func expandForFullBody(_ bbox: CGRect) -> CGRect {
-        let widthScale: CGFloat = 1.35
-        let heightScale: CGFloat = 2.0
+        let widthScale: CGFloat = 1.5
+        let heightScale: CGFloat = 2.4
 
         let expandedWidth = min(1, bbox.width * widthScale)
         let expandedHeight = min(1, bbox.height * heightScale)
 
         // Shift center slightly down to include legs when detector is torso-biased.
         let centerX = bbox.midX
-        let centerY = bbox.midY - bbox.height * 0.15
+        let centerY = bbox.midY - bbox.height * 0.2
 
         let x = max(0, min(1 - expandedWidth, centerX - expandedWidth / 2))
         let y = max(0, min(1 - expandedHeight, centerY - expandedHeight / 2))
