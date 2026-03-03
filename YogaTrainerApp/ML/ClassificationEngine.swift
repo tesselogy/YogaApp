@@ -5,14 +5,15 @@ import Foundation
 class ClassificationEngine {
 
     private var model: VNCoreMLModel?
+    private var lastLogTime: Date = .distantPast
 
     init() {
         model = Self.loadModel(named: "best")
 
         if model == nil {
-            print("[ClassificationEngine] Classifier model missing: best.mlmodelc was not found in app bundle")
+            print("[ClassificationEngine] Model missing: best.mlmodelc was not found in app bundle")
         } else {
-            print("[ClassificationEngine] Classifier model loaded successfully")
+            print("[ClassificationEngine] Model loaded successfully")
         }
     }
 
@@ -25,26 +26,44 @@ class ClassificationEngine {
             return
         }
 
-        performClassification(buffer: buffer, model: model, roi: regionOfInterest) { label, confidence in
+        performInference(buffer: buffer, model: model, roi: regionOfInterest) { label, confidence in
             if label == "unknown", regionOfInterest != nil {
-                self.performClassification(buffer: buffer, model: model, roi: nil, completion: completion)
+                self.debugLog("ROI inference returned unknown, retrying full-frame")
+                self.performInference(buffer: buffer, model: model, roi: nil, completion: completion)
             } else {
                 completion(label, confidence)
             }
         }
     }
 
-    private func performClassification(buffer: CVPixelBuffer,
-                                       model: VNCoreMLModel,
-                                       roi: CGRect?,
-                                       completion: @escaping (String, Double) -> Void) {
+    private func performInference(buffer: CVPixelBuffer,
+                                  model: VNCoreMLModel,
+                                  roi: CGRect?,
+                                  completion: @escaping (String, Double) -> Void) {
         let request = VNCoreMLRequest(model: model) { request, _ in
-            if let results = request.results as? [VNClassificationObservation],
-               let first = results.first {
-                completion(first.identifier, Double(first.confidence))
-            } else {
+            guard let results = request.results, !results.isEmpty else {
+                self.debugLog("Inference returned empty results")
                 completion("unknown", 0)
+                return
             }
+
+            if let classes = results as? [VNClassificationObservation],
+               let first = classes.first {
+                completion(first.identifier, Double(first.confidence))
+                return
+            }
+
+            if let objects = results as? [VNRecognizedObjectObservation],
+               let bestObject = objects.max(by: { $0.confidence < $1.confidence }),
+               let bestLabel = bestObject.labels.first {
+                self.debugLog("Model output is object-detection style, using top label '\(bestLabel.identifier)'")
+                completion(bestLabel.identifier, Double(bestLabel.confidence))
+                return
+            }
+
+            let outputType = String(describing: type(of: results[0]))
+            self.debugLog("Unsupported Vision output type: \(outputType)")
+            completion("unknown", 0)
         }
 
         request.imageCropAndScaleOption = .scaleFit
@@ -57,7 +76,7 @@ class ClassificationEngine {
         do {
             try handler.perform([request])
         } catch {
-            print("[ClassificationEngine] Classification failed: \(error.localizedDescription)")
+            print("[ClassificationEngine] Inference failed: \(error.localizedDescription)")
             completion("unknown", 0)
         }
     }
@@ -69,5 +88,12 @@ class ClassificationEngine {
         }
 
         return try? VNCoreMLModel(for: model)
+    }
+
+    private func debugLog(_ message: String) {
+        let now = Date()
+        guard now.timeIntervalSince(lastLogTime) > 1 else { return }
+        lastLogTime = now
+        print("[ClassificationEngine] \(message)")
     }
 }

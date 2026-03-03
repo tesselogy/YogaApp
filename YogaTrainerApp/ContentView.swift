@@ -15,7 +15,7 @@ struct ContentView: View {
     @State var detectionStatus: String = "Waiting for person..."
 
     private func expandedROI(from bbox: CGRect) -> CGRect {
-        let scale: CGFloat = 1.35
+        let scale: CGFloat = 1.8
         let newWidth = min(1, bbox.width * scale)
         let newHeight = min(1, bbox.height * scale)
         let newX = max(0, min(1 - newWidth, bbox.midX - newWidth / 2))
