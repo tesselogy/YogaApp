@@ -9,6 +9,14 @@ struct Detection {
     let classIndex: Int
 }
 
+private struct InputPreparation {
+    let buffer: CVPixelBuffer
+    let modelWidth: Int
+    let modelHeight: Int
+    let frameWidth: Int
+    let frameHeight: Int
+}
+
 final class YOLODetector {
     static var lastInitError: String = ""
 
@@ -66,19 +74,24 @@ final class YOLODetector {
     }
 
     func detectPersons(in frame: CVPixelBuffer) -> [Detection] {
-        let actualFormat = CVPixelBufferGetPixelFormatType(frame)
-        guard let inputBuffer = makeInputBufferIfNeeded(from: frame) else {
-            lastDebugMessage = "input_convert_failed expected=\(pixelFormatName(inputConstraint?.pixelFormatType ?? 0)) actual=\(pixelFormatName(actualFormat))"
+        guard let prepared = makeInputBufferIfNeeded(from: frame) else {
+            let actualFormat = CVPixelBufferGetPixelFormatType(frame)
+            let expectedSize = expectedModelSizeDescription()
+            lastDebugMessage = "input_prepare_failed expected_fmt=\(pixelFormatName(inputConstraint?.pixelFormatType ?? 0)) actual_fmt=\(pixelFormatName(actualFormat)) expected_size=\(expectedSize) actual_size=\(CVPixelBufferGetWidth(frame))x\(CVPixelBufferGetHeight(frame))"
             return []
         }
 
         do {
-            let provider = try MLDictionaryFeatureProvider(dictionary: [inputName: MLFeatureValue(pixelBuffer: inputBuffer)])
+            let provider = try MLDictionaryFeatureProvider(dictionary: [inputName: MLFeatureValue(pixelBuffer: prepared.buffer)])
             let prediction = try model.prediction(from: provider)
 
-            let frameWidth = CVPixelBufferGetWidth(frame)
-            let frameHeight = CVPixelBufferGetHeight(frame)
-            let all = decodeYOLOOutput(prediction: prediction, frameWidth: frameWidth, frameHeight: frameHeight)
+            let all = decodeYOLOOutput(
+                prediction: prediction,
+                frameWidth: prepared.frameWidth,
+                frameHeight: prepared.frameHeight,
+                modelInputWidth: prepared.modelWidth,
+                modelInputHeight: prepared.modelHeight
+            )
             let persons = all.filter { $0.classIndex == personClassIndex }
             let nms = nonMaximumSuppression(persons, iouThreshold: iouThreshold)
 
@@ -89,11 +102,14 @@ final class YOLODetector {
                 }
                 .joined(separator: ",")
 
-            lastDebugMessage = "fmt=\(pixelFormatName(actualFormat))->\(pixelFormatName(CVPixelBufferGetPixelFormatType(inputBuffer))) outputs=[\(shapeInfo)] all=\(all.count) person=\(persons.count) nms=\(nms.count)"
+            let actualFormat = CVPixelBufferGetPixelFormatType(frame)
+            let preparedFormat = CVPixelBufferGetPixelFormatType(prepared.buffer)
+            lastDebugMessage = "fmt=\(pixelFormatName(actualFormat))->\(pixelFormatName(preparedFormat)) size=\(prepared.frameWidth)x\(prepared.frameHeight)->\(prepared.modelWidth)x\(prepared.modelHeight) outputs=[\(shapeInfo)] all=\(all.count) person=\(persons.count) nms=\(nms.count)"
             return nms
         } catch {
             let expected = pixelFormatName(inputConstraint?.pixelFormatType ?? 0)
-            lastDebugMessage = "prediction_failed expected=\(expected) actual=\(pixelFormatName(actualFormat)) err=\(error.localizedDescription)"
+            let expectedSize = expectedModelSizeDescription()
+            lastDebugMessage = "prediction_failed expected_fmt=\(expected) expected_size=\(expectedSize) err=\(error.localizedDescription)"
             return []
         }
     }
@@ -104,7 +120,9 @@ final class YOLODetector {
 
     private func decodeYOLOOutput(prediction: MLFeatureProvider,
                                   frameWidth: Int,
-                                  frameHeight: Int) -> [Detection] {
+                                  frameHeight: Int,
+                                  modelInputWidth: Int,
+                                  modelInputHeight: Int) -> [Detection] {
         let multiArrays: [MLMultiArray] = outputNames.compactMap { prediction.featureValue(for: $0)?.multiArrayValue }
         guard let tensor = multiArrays.max(by: { $0.count < $1.count }) else { return [] }
 
@@ -137,8 +155,11 @@ final class YOLODetector {
                 guard bestScore >= confidenceThreshold else { continue }
 
                 let normalized = max(abs(cx), abs(cy), abs(w), abs(h)) <= 2.0
-                let sx: Float = normalized ? Float(frameWidth) : 1
-                let sy: Float = normalized ? Float(frameHeight) : 1
+                let mapX: Float = (modelInputWidth > 0 && modelInputWidth != frameWidth) ? Float(frameWidth) / Float(modelInputWidth) : 1
+                let mapY: Float = (modelInputHeight > 0 && modelInputHeight != frameHeight) ? Float(frameHeight) / Float(modelInputHeight) : 1
+
+                let sx: Float = normalized ? Float(frameWidth) : mapX
+                let sy: Float = normalized ? Float(frameHeight) : mapY
 
                 let x1 = max(0, min(Float(frameWidth - 1), (cx - w / 2) * sx))
                 let y1 = max(0, min(Float(frameHeight - 1), (cy - h / 2) * sy))
@@ -172,8 +193,10 @@ final class YOLODetector {
                 guard conf >= confidenceThreshold else { continue }
 
                 let normalized = max(abs(x1raw), abs(y1raw), abs(x2raw), abs(y2raw)) <= 2.0
-                let sx: Float = normalized ? Float(frameWidth) : 1
-                let sy: Float = normalized ? Float(frameHeight) : 1
+                let mapX: Float = (modelInputWidth > 0 && modelInputWidth != frameWidth) ? Float(frameWidth) / Float(modelInputWidth) : 1
+                let mapY: Float = (modelInputHeight > 0 && modelInputHeight != frameHeight) ? Float(frameHeight) / Float(modelInputHeight) : 1
+                let sx: Float = normalized ? Float(frameWidth) : mapX
+                let sy: Float = normalized ? Float(frameHeight) : mapY
 
                 let x1 = max(0, min(Float(frameWidth - 1), x1raw * sx))
                 let y1 = max(0, min(Float(frameHeight - 1), y1raw * sy))
@@ -194,18 +217,26 @@ final class YOLODetector {
         return []
     }
 
-    private func makeInputBufferIfNeeded(from frame: CVPixelBuffer) -> CVPixelBuffer? {
-        guard let inputConstraint else { return frame }
+    private func makeInputBufferIfNeeded(from frame: CVPixelBuffer) -> InputPreparation? {
+        let frameWidth = CVPixelBufferGetWidth(frame)
+        let frameHeight = CVPixelBufferGetHeight(frame)
+
+        guard let inputConstraint else {
+            return InputPreparation(buffer: frame, modelWidth: frameWidth, modelHeight: frameHeight, frameWidth: frameWidth, frameHeight: frameHeight)
+        }
 
         let expectedFormat = inputConstraint.pixelFormatType
         let actualFormat = CVPixelBufferGetPixelFormatType(frame)
 
-        if expectedFormat == 0 || expectedFormat == actualFormat {
-            return frame
-        }
+        let expectedWidth = inputConstraint.pixelsWide > 0 ? inputConstraint.pixelsWide : frameWidth
+        let expectedHeight = inputConstraint.pixelsHigh > 0 ? inputConstraint.pixelsHigh : frameHeight
 
-        let width = CVPixelBufferGetWidth(frame)
-        let height = CVPixelBufferGetHeight(frame)
+        let needsFormatConversion = expectedFormat != 0 && expectedFormat != actualFormat
+        let needsResize = frameWidth != expectedWidth || frameHeight != expectedHeight
+
+        if !needsFormatConversion && !needsResize {
+            return InputPreparation(buffer: frame, modelWidth: frameWidth, modelHeight: frameHeight, frameWidth: frameWidth, frameHeight: frameHeight)
+        }
 
         var converted: CVPixelBuffer?
         let attrs: [CFString: Any] = [
@@ -213,10 +244,12 @@ final class YOLODetector {
             kCVPixelBufferCGBitmapContextCompatibilityKey: true
         ]
 
+        let outputFormat = expectedFormat == 0 ? actualFormat : expectedFormat
+
         guard CVPixelBufferCreate(kCFAllocatorDefault,
-                                  width,
-                                  height,
-                                  expectedFormat,
+                                  expectedWidth,
+                                  expectedHeight,
+                                  outputFormat,
                                   attrs as CFDictionary,
                                   &converted) == kCVReturnSuccess,
               let converted else {
@@ -224,8 +257,26 @@ final class YOLODetector {
         }
 
         let ciImage = CIImage(cvPixelBuffer: frame)
-        ciContext.render(ciImage, to: converted)
-        return converted
+        let sourceRect = CGRect(x: 0, y: 0, width: frameWidth, height: frameHeight)
+        let targetRect = CGRect(x: 0, y: 0, width: expectedWidth, height: expectedHeight)
+        let scaleX = targetRect.width / sourceRect.width
+        let scaleY = targetRect.height / sourceRect.height
+        let resized = ciImage.transformed(by: CGAffineTransform(scaleX: scaleX, y: scaleY))
+        ciContext.render(resized, to: converted)
+
+        return InputPreparation(buffer: converted,
+                                modelWidth: expectedWidth,
+                                modelHeight: expectedHeight,
+                                frameWidth: frameWidth,
+                                frameHeight: frameHeight)
+    }
+
+    private func expectedModelSizeDescription() -> String {
+        guard let inputConstraint else { return "flexible" }
+        if inputConstraint.pixelsWide > 0 && inputConstraint.pixelsHigh > 0 {
+            return "\(inputConstraint.pixelsWide)x\(inputConstraint.pixelsHigh)"
+        }
+        return "flexible"
     }
 
     private func pixelFormatName(_ type: OSType) -> String {
