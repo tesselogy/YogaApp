@@ -15,13 +15,22 @@ struct ContentView: View {
 
         ZStack {
 
-            if let buffer = camera.currentBuffer {
-                Image(decorative: CIImage(cvPixelBuffer: buffer), scale: 1)
-                    .resizable()
+            if camera.currentBuffer != nil {
+                CameraPreview(pixelBuffer: camera.currentBuffer)
                     .scaledToFill()
-                    .onAppear {
+                    .onChange(of: camera.currentBuffer) { _, newBuffer in
+
+                        guard let buffer = newBuffer else { return }
+
                         focusEngine.process(buffer: buffer) { obs in
+
                             trackedObservation = obs
+
+                            classifier.classify(buffer: buffer) { label, confidence in
+                                DispatchQueue.main.async {
+                                    poseState.update(newPose: label)
+                                }
+                            }
                         }
                     }
             }
