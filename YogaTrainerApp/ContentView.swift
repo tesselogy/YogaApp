@@ -14,6 +14,9 @@ struct ContentView: View {
     @State var classificationROI: CGRect?
     @State var detectionStatus: String = "Waiting for person..."
     @State var isProcessingFrame: Bool = false
+    @State private var frameCounter: Int = 0
+
+    private let processingQueue = DispatchQueue(label: "vision.processing.queue", qos: .userInitiated)
 
     private func expandedROI(from bbox: CGRect) -> CGRect {
         let scale: CGFloat = 1.8
@@ -29,41 +32,43 @@ struct ContentView: View {
         GeometryReader { geo in
             ZStack {
 
-                if camera.currentBuffer != nil {
-                    CameraPreview(pixelBuffer: camera.currentBuffer)
-                        .scaledToFill()
-                        .onChange(of: camera.currentBuffer) { _, newBuffer in
+                CameraPreview(session: camera.captureSession)
+                    .scaledToFill()
+                    .onChange(of: camera.currentBuffer) { _, newBuffer in
                             guard let buffer = newBuffer else { return }
                             guard !isProcessingFrame else { return }
+
                             isProcessingFrame = true
+                            frameCounter += 1
 
-                            focusEngine.process(buffer: buffer) { obs in
-                                guard let obs else {
-                                    DispatchQueue.main.async {
-                                        trackedObservation = nil
-                                        classificationROI = nil
-                                        detectionStatus = "Person not detected"
-                                        poseState.update(newPose: "no_person")
-                                        isProcessingFrame = false
+                            let cachedObservation = trackedObservation
+                            let shouldRedetect = cachedObservation == nil || frameCounter % 3 == 0
+
+                            processingQueue.async {
+                                if shouldRedetect {
+                                    focusEngine.process(buffer: buffer) { obs in
+                                        guard let obs else {
+                                            DispatchQueue.main.async {
+                                                trackedObservation = nil
+                                                classificationROI = nil
+                                                detectionStatus = "Person not detected"
+                                                poseState.update(newPose: "no_person")
+                                                isProcessingFrame = false
+                                            }
+                                            return
+                                        }
+
+                                        classify(buffer: buffer, observation: obs)
                                     }
-                                    return
-                                }
-
-                                let roi = expandedROI(from: obs.boundingBox)
-
-                                classifier.classify(buffer: buffer, regionOfInterest: roi) { label, confidence in
+                                } else if let cachedObservation {
+                                    classify(buffer: buffer, observation: cachedObservation)
+                                } else {
                                     DispatchQueue.main.async {
-                                        trackedObservation = obs
-                                        classificationROI = roi
-                                        detectionStatus = "Person detected"
-                                        poseState.update(newPose: label)
-                                        print("[ContentView] pose=\(label) confidence=\(String(format: "%.2f", confidence)) detection=\(detectionStatus)")
                                         isProcessingFrame = false
                                     }
                                 }
                             }
                         }
-                }
 
                 if let trackedObservation {
                     DetectionBox(observation: trackedObservation)
@@ -144,6 +149,21 @@ struct ContentView: View {
                 }
             }
             .ignoresSafeArea()
+        }
+    }
+
+    private func classify(buffer: CVPixelBuffer, observation: VNDetectedObjectObservation) {
+        let roi = expandedROI(from: observation.boundingBox)
+
+        classifier.classify(buffer: buffer, regionOfInterest: roi) { label, confidence in
+            DispatchQueue.main.async {
+                trackedObservation = observation
+                classificationROI = roi
+                detectionStatus = "Person detected"
+                poseState.update(newPose: label)
+                print("[ContentView] pose=\(label) confidence=\(String(format: "%.2f", confidence)) detection=\(detectionStatus)")
+                isProcessingFrame = false
+            }
         }
     }
 }

@@ -6,7 +6,9 @@ class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
     @Published var currentBuffer: CVPixelBuffer?
 
     private let session = AVCaptureSession()
+    var captureSession: AVCaptureSession { session }
     private let output = AVCaptureVideoDataOutput()
+    private let videoQueue = DispatchQueue(label: "camera.video.queue", qos: .userInitiated)
 
     override init() {
         super.init()
@@ -14,7 +16,7 @@ class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
     }
 
     private func setup() {
-        session.sessionPreset = .high
+        session.sessionPreset = .hd1280x720
 
         guard let device = AVCaptureDevice.default(for: .video),
               let input = try? AVCaptureDeviceInput(device: device)
@@ -22,7 +24,11 @@ class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
 
         session.addInput(input)
 
-        output.setSampleBufferDelegate(self, queue: DispatchQueue(label: "videoQueue"))
+        output.alwaysDiscardsLateVideoFrames = true
+        output.videoSettings = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
+        ]
+        output.setSampleBufferDelegate(self, queue: videoQueue)
         session.addOutput(output)
 
         session.startRunning()
@@ -34,8 +40,6 @@ class CameraManager: NSObject, ObservableObject, AVCaptureVideoDataOutputSampleB
 
         guard let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
 
-        DispatchQueue.main.async {
-            self.currentBuffer = buffer
-        }
+        DispatchQueue.main.async { self.currentBuffer = buffer }
     }
 }
