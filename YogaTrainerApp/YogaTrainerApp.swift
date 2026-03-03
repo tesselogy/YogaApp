@@ -1,7 +1,7 @@
 import SwiftUI
 
 @main
-struct YogaTrainerApp: App {
+struct YogaTrainerMacAppMain: App {
     var body: some Scene {
         WindowGroup {
             ContentView()
