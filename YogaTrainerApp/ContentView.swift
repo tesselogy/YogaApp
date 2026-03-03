@@ -13,6 +13,7 @@ struct ContentView: View {
     @State var trackedObservation: VNDetectedObjectObservation?
     @State var classificationROI: CGRect?
     @State var detectionStatus: String = "Waiting for person..."
+    @State var isProcessingFrame: Bool = false
 
     private func expandedROI(from bbox: CGRect) -> CGRect {
         let scale: CGFloat = 1.8
@@ -32,34 +33,32 @@ struct ContentView: View {
                     CameraPreview(pixelBuffer: camera.currentBuffer)
                         .scaledToFill()
                         .onChange(of: camera.currentBuffer) { _, newBuffer in
-
                             guard let buffer = newBuffer else { return }
+                            guard !isProcessingFrame else { return }
+                            isProcessingFrame = true
 
                             focusEngine.process(buffer: buffer) { obs in
-                                DispatchQueue.main.async {
-                                    trackedObservation = obs
-                                    detectionStatus = obs == nil ? "Person not detected" : "Person detected"
-                                }
-
                                 guard let obs else {
                                     DispatchQueue.main.async {
+                                        trackedObservation = nil
                                         classificationROI = nil
+                                        detectionStatus = "Person not detected"
                                         poseState.update(newPose: "no_person")
-                                        print("[ContentView] skip classify: no person detected")
+                                        isProcessingFrame = false
                                     }
                                     return
                                 }
 
                                 let roi = expandedROI(from: obs.boundingBox)
 
-                                DispatchQueue.main.async {
-                                    classificationROI = roi
-                                }
-
                                 classifier.classify(buffer: buffer, regionOfInterest: roi) { label, confidence in
                                     DispatchQueue.main.async {
+                                        trackedObservation = obs
+                                        classificationROI = roi
+                                        detectionStatus = "Person detected"
                                         poseState.update(newPose: label)
                                         print("[ContentView] pose=\(label) confidence=\(String(format: "%.2f", confidence)) detection=\(detectionStatus)")
+                                        isProcessingFrame = false
                                     }
                                 }
                             }

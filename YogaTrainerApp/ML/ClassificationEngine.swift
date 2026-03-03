@@ -5,15 +5,21 @@ import Foundation
 class ClassificationEngine {
 
     private var model: VNCoreMLModel?
+    private var classLabels: [String] = []
     private var lastLogTime: Date = .distantPast
 
     init() {
-        model = Self.loadModel(named: "best")
+        let loaded = Self.loadModel(named: "best")
+        model = loaded.vnModel
+        classLabels = loaded.classLabels
 
         if model == nil {
             print("[ClassificationEngine] Model missing: best.mlmodelc was not found in app bundle")
         } else {
             print("[ClassificationEngine] Model loaded successfully")
+            if !classLabels.isEmpty {
+                debugLog("Loaded \(classLabels.count) class labels from model metadata")
+            }
         }
     }
 
@@ -61,6 +67,12 @@ class ClassificationEngine {
                 return
             }
 
+            if let featureObs = results.first as? VNCoreMLFeatureValueObservation,
+               let resolved = self.resolveFeatureValueObservation(featureObs) {
+                completion(resolved.label, resolved.confidence)
+                return
+            }
+
             let outputType = String(describing: type(of: results[0]))
             self.debugLog("Unsupported Vision output type: \(outputType)")
             completion("unknown", 0)
@@ -81,13 +93,71 @@ class ClassificationEngine {
         }
     }
 
-    private static func loadModel(named name: String) -> VNCoreMLModel? {
-        guard let url = Bundle.main.url(forResource: name, withExtension: "mlmodelc"),
-              let model = try? MLModel(contentsOf: url) else {
-            return nil
+    private func resolveFeatureValueObservation(_ observation: VNCoreMLFeatureValueObservation) -> (label: String, confidence: Double)? {
+        let value = observation.featureValue
+
+        if let multi = value.multiArrayValue,
+           let (index, confidence) = Self.argmax(from: multi) {
+            let label = index < classLabels.count ? classLabels[index] : "class_\(index)"
+            debugLog("FeatureValue(MultiArray) resolved as \(label) @ \(String(format: "%.2f", confidence))")
+            return (label, confidence)
         }
 
-        return try? VNCoreMLModel(for: model)
+        if let dict = value.dictionaryValue as? [AnyHashable: NSNumber],
+           let best = dict.max(by: { $0.value.doubleValue < $1.value.doubleValue }) {
+            let label = String(describing: best.key)
+            let confidence = best.value.doubleValue
+            debugLog("FeatureValue(Dictionary) resolved as \(label) @ \(String(format: "%.2f", confidence))")
+            return (label, confidence)
+        }
+
+        debugLog("FeatureValue type not supported: \(value.type)")
+        return nil
+    }
+
+    private static func argmax(from multi: MLMultiArray) -> (index: Int, confidence: Double)? {
+        let count = multi.count
+        guard count > 0 else { return nil }
+
+        var bestIndex = 0
+        var bestValue = -Double.greatestFiniteMagnitude
+
+        for i in 0 ..< count {
+            let value = multi[i].doubleValue
+            if value > bestValue {
+                bestValue = value
+                bestIndex = i
+            }
+        }
+
+        return (bestIndex, bestValue)
+    }
+
+    private static func loadModel(named name: String) -> (vnModel: VNCoreMLModel?, classLabels: [String]) {
+        guard let url = Bundle.main.url(forResource: name, withExtension: "mlmodelc"),
+              let rawModel = try? MLModel(contentsOf: url),
+              let vnModel = try? VNCoreMLModel(for: rawModel) else {
+            return (nil, [])
+        }
+
+        let labels = Self.extractClassLabels(from: rawModel)
+        return (vnModel, labels)
+    }
+
+    private static func extractClassLabels(from model: MLModel) -> [String] {
+        guard let labels = model.modelDescription.classLabels else {
+            return []
+        }
+
+        if let stringLabels = labels as? [String] {
+            return stringLabels
+        }
+
+        if let intLabels = labels as? [Int] {
+            return intLabels.map(String.init)
+        }
+
+        return []
     }
 
     private func debugLog(_ message: String) {
